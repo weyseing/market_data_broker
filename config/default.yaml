@@ -1,0 +1,21 @@
+log_level: INFO
+
+coinbase:
+  ws_url: wss://ws-feed.exchange.coinbase.com
+  channels: [ticker, matches, level2_batch]
+  reconnect:
+    initial_backoff_seconds: 1
+    max_backoff_seconds: 30
+  heartbeat_timeout_seconds: 15
+
+bus:
+  consumer_queue_size: 1000
+  sustained_overflow_drops: 100
+
+ws_server:
+  host: 0.0.0.0
+  port: 8765
+
+status_server:
+  host: 0.0.0.0
+  port: 8080

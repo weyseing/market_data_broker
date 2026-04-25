@@ -1,0 +1,123 @@
+IMPLEMENTATION PLAN — Real-Time Market Data Hub with MCP Interface
+Date: 2026-04-25
+Approach: inside-out (build dependencies first, then producer), with one early Coinbase spike to de-risk the external integration.
+
+STATUS
+  [x] Step 1     — Scaffolding                         (done 2026-04-25)
+  [ ] Step 1.5   — Coinbase WS spike                   ← NEXT
+  [ ] Step 2     — Domain models & topic naming
+  [ ] Step 3     — In-memory pub/sub bus
+  [ ] Step 4     — Connection registry
+  [ ] Step 5     — Coinbase ingestion (real)
+  [ ] Step 6     — Snapshot store
+  [ ] Step 7     — Downstream WebSocket server
+  [ ] Step 8     — MCP server (stdio + http)
+  [ ] Step 9     — Context documentation in /docs
+  [ ] Step 10    — Operational polish
+  [ ] Step 11    — Containerisation + architecture write-up
+
+STACK
+- Python 3.11+, asyncio
+- websockets, pydantic, mcp (FastMCP), structlog, pyyaml
+- Tests: pytest, pytest-asyncio
+- Single Docker container, in-memory state only
+
+TOPIC NAMING
+  coinbase.{channel}.{product_id}    e.g. coinbase.ticker.BTC-USD
+  Channels in scope: ticker, matches, level2_batch
+  Venue prefix leaves room to add binance.* later without breaking changes.
+
+BACKPRESSURE
+  Bounded asyncio.Queue per consumer (default 1000).
+  Overflow → drop-oldest + increment dropped_messages counter (visible in status).
+  Sustained overflow → disconnect consumer with reason.
+
+------------------------------------------------------------
+STEPS (each ends with a verify; we don't move on until it passes)
+------------------------------------------------------------
+
+Step 1  — Scaffolding                                                       [DONE]
+  pyproject.toml, .gitignore, src/market_data_broker/, tests/, config/default.yaml
+  structlog JSON logging
+  Verify: `python -m market_data_broker` boots, logs "hub starting", exits clean on SIGINT.
+  Outcome: venv on python3.12, `pip install -e ".[dev]"` clean, smoke test passes,
+           SIGINT exits with code 0; JSON logs hub starting → ready → stopping.
+
+Step 1.5 — Coinbase WS spike (throwaway)
+  scripts/spike_coinbase.py — connect, subscribe BTC-USD ticker, print raw frames.
+  Goal: confirm real message shapes before locking in models in Step 2.
+  Verify: see live ticker frames in terminal.
+
+Step 2  — Domain models & topic naming
+  models.py: Pydantic Ticker, Trade, L2Update, Message envelope.
+  topics.py: topic_for(), parse_topic(), validators.
+  Verify: pytest tests/test_topics.py tests/test_models.py passes.
+
+Step 3  — In-memory pub/sub bus
+  bus.py: InMemoryBus.publish / subscribe / unsubscribe.
+  Bounded per-consumer queues, drop-oldest, drop counters.
+  Verify: multi-consumer fan-out + slow-consumer + dynamic sub/unsub tests pass.
+
+Step 4  — Connection registry
+  registry.py: tracks upstream conns, downstream consumers, ref-counted (channel, product_id) → {consumer_ids}.
+  Callbacks: on_first_subscriber, on_last_unsubscriber.
+  status() returns active conns, uptime, msg/sec, drop counts.
+  Verify: ref-count edge-case tests pass (1→0, 0→1, churn, leaks on disconnect).
+
+Step 5  — Coinbase ingestion (real)
+  ingest/coinbase.py: WS client, demand-driven sub/unsub via registry callbacks.
+  Lifecycle: connect → heartbeat watchdog → exp-backoff reconnect → re-subscribe live topics.
+  Normalises raw → Message envelope → publishes to bus.
+  Verify: fake-WS integration test (clean connect, reconnect, stale heartbeat) + manual run vs real Coinbase.
+
+Step 6  — Snapshot store
+  snapshot.py: subscribes to bus internally; tracks last ticker, last trade, best bid/ask, last_update_ts per symbol.
+  Verify: synthetic-stream tests pass.
+
+Step 7  — Downstream WebSocket server
+  server/ws.py: WS server for non-MCP consumers.
+  Protocol: {action: subscribe|unsubscribe, topics: [...]}.
+  Each conn registered in registry, fed from bus, clean tear-down on disconnect.
+  Verify: pytest test_ws_server.py passes; manual websocat shows live ticker.
+
+Step 8  — MCP server
+  server/mcp_server.py with FastMCP. Tools (LLM-first names + descriptions):
+    list_topics()
+    describe_topic(topic)
+    get_snapshot(product_id)
+    get_hub_status()
+    stream_topic(topic, max_messages=100, timeout_ms=5000)   # poll-based batch
+  Wired to same bus / registry / snapshot.
+  Expose BOTH transports:
+    `market-data-broker mcp --stdio`   (default, for local Claude Desktop)
+    `market-data-broker mcp --http`    (for Docker / remote agents)
+  Verify: MCP inspector exercises every tool over stdio AND http; schemas render correctly.
+
+Step 9  — Context documentation in /docs
+  context.md         — purpose, scope, non-goals
+  topics.md          — every topic: schema, cadence, real example payload
+  worked_examples.md — agent walkthroughs ("get current mid for BTC-USD → call X with Y → expect Z")
+  failure_modes.md   — stale topic, dropped conn, unknown symbol, hub restart
+  Verify: hand docs+toolset to a fresh agent, it completes a sample task on first try.
+
+Step 10 — Operational polish
+  YAML config + env-var overrides (config.py).
+  Consistent JSON log fields (event, consumer_id, topic, latency_ms).
+  /status HTTP endpoint mirroring get_hub_status().
+  Full README: quickstart, run modes, restart-state caveats.
+  Verify: tests green, /status returns 200.
+
+Step 11 — Containerisation + architecture write-up
+  Multi-stage Dockerfile, docker-compose.yml.
+  docs/architecture.md — one page: layer diagram, trade-offs, extension path for new venues.
+  Verify: docker run boots end-to-end against real Coinbase.
+
+------------------------------------------------------------
+END-TO-END VERIFY (after all steps)
+------------------------------------------------------------
+1. pytest -q                                                          → all green
+2. docker run --rm market-data-broker                                 → ticker flowing
+3. websocat ws://localhost:8765 + subscribe                           → live messages
+4. MCP inspector → exercise all 5 tools                               → well-formed results
+5. Fresh agent given only /docs + tool list answers "mid for BTC-USD" → first-try success
+6. Kill upstream WS mid-flight                                        → auto-reconnect, no leaked subs in get_hub_status
