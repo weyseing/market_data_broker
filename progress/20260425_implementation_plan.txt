@@ -4,9 +4,9 @@ Approach: inside-out (build dependencies first, then producer), with one early C
 
 STATUS
   [x] Step 1     — Scaffolding                         (done 2026-04-25)
-  [ ] Step 1.5   — Coinbase WS spike                   ← NEXT
-  [ ] Step 2     — Domain models & topic naming
-  [ ] Step 3     — In-memory pub/sub bus
+  [x] Step 1.5   — Coinbase WS spike                   (done 2026-04-25)
+  [x] Step 2     — Domain models & topic naming        (done 2026-04-25)
+  [ ] Step 3     — In-memory pub/sub bus                ← NEXT
   [ ] Step 4     — Connection registry
   [ ] Step 5     — Coinbase ingestion (real)
   [ ] Step 6     — Snapshot store
@@ -43,15 +43,35 @@ Step 1  — Scaffolding                                                       [D
   Outcome: venv on python3.12, `pip install -e ".[dev]"` clean, smoke test passes,
            SIGINT exits with code 0; JSON logs hub starting → ready → stopping.
 
-Step 1.5 — Coinbase WS spike (throwaway)
+Step 1.5 — Coinbase WS spike (throwaway)                                    [DONE]
   scripts/spike_coinbase.py — connect, subscribe BTC-USD ticker, print raw frames.
   Goal: confirm real message shapes before locking in models in Step 2.
   Verify: see live ticker frames in terminal.
+  Outcome: ticker / matches / level2_batch shapes captured against real Coinbase.
+           Findings → progress/20260425_spike_coinbase_findings.md
+           Notable: (a) `level2_batch` is server-aliased to `level2_50` (top-50);
+                    (b) level2 snapshot ~1 MB → must connect with max_size=None
+                        (default 1 MiB triggers close code 1009);
+                    (c) all numerics are strings — use Decimal in models;
+                    (d) matches type is "last_match" (first) then "match".
 
-Step 2  — Domain models & topic naming
+Step 2  — Domain models & topic naming                                      [DONE]
   models.py: Pydantic Ticker, Trade, L2Update, Message envelope.
   topics.py: topic_for(), parse_topic(), validators.
   Verify: pytest tests/test_topics.py tests/test_models.py passes.
+  Outcome: 54 unit tests green; lint clean (ruff E,F,I,B,UP,N).
+           Decisions worth flagging:
+           - Added L2Snapshot as a 4th payload type (spike showed snapshot frames
+             are distinct from l2update; modelling what's on the wire beats the plan's
+             3-type list).
+           - Trade carries Literal["match","last_match"] — single class, both
+             discriminator values, since fields are identical.
+           - extra="ignore" on payload models — Coinbase adds fields without
+             versioning (volume_30d precedent); tests pin the fields we depend on.
+           - Exceptions named *Error to satisfy ruff N818.
+           - parse_coinbase_frame() raises UnknownFrameTypeError on subscriptions /
+             heartbeat / error frames; ingest layer (Step 5) must filter those before
+             calling.
 
 Step 3  — In-memory pub/sub bus
   bus.py: InMemoryBus.publish / subscribe / unsubscribe.
