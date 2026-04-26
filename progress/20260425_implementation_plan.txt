@@ -7,8 +7,8 @@ STATUS
   [x] Step 1.5   — Coinbase WS spike                   (done 2026-04-25)
   [x] Step 2     — Domain models & topic naming        (done 2026-04-25)
   [x] Step 3     — In-memory pub/sub bus                (done 2026-04-26)
-  [ ] Step 4     — Connection registry                  ← NEXT
-  [ ] Step 5     — Coinbase ingestion (real)
+  [x] Step 4     — Connection registry                  (done 2026-04-26)
+  [ ] Step 5     — Coinbase ingestion (real)            ← NEXT
   [ ] Step 6     — Snapshot store
   [ ] Step 7     — Downstream WebSocket server
   [ ] Step 8     — MCP server (stdio + http)
@@ -95,11 +95,37 @@ Step 3  — In-memory pub/sub bus                                             [D
            - Closed-but-non-empty subscriptions still drain on async-for, then
              stop cleanly. Closed-and-empty raises SubscriptionClosedError.
 
-Step 4  — Connection registry
+Step 4  — Connection registry                                              [DONE]
   registry.py: tracks upstream conns, downstream consumers, ref-counted (channel, product_id) → {consumer_ids}.
   Callbacks: on_first_subscriber, on_last_unsubscriber.
   status() returns active conns, uptime, msg/sec, drop counts.
   Verify: ref-count edge-case tests pass (1→0, 0→1, churn, leaks on disconnect).
+  Outcome: 32 new tests green; full suite 115/115; ruff clean.
+           Decisions worth flagging:
+           - Refcount keyed by full topic string (not (channel, product_id))
+             so the registry stays venue-agnostic — adding binance.* later
+             is just more topics, no schema change.
+           - Refcount is dict[topic, set[consumer_id]] — pruned when empty so
+             ``topic in _refcount`` is a true "anyone subscribed?" check.
+           - Callbacks are async (Step 5 ingest will need to send WS frames).
+             Fired in input order at register-time → deterministic behaviour
+             for ingest implementations that batch upstream subscribe frames.
+           - Callback errors propagate; we don't roll back state. The caller
+             (ingest) decides whether to retry or surface the failure.
+           - Direct sub.add_topic() bypasses the refcount. The registry IS the
+             public API for subscription management; the bus is internal.
+             Documented in the registry module docstring.
+           - Consumers must go through registry; bus subs created by registry
+             carry the consumer_id explicitly so logs/stats stay correlated.
+           - record_message() lives on the registry rather than on the bus —
+             keeps the bus a pure routing primitive; observability is hub-level
+             concern. Ingest layer (Step 5) will call it on every publish.
+           - msg/sec computed as messages_total / hub_uptime (a true average
+             since-startup, not a sliding window). Honest and simple; can swap
+             in EWMA later if dashboards demand instant rate.
+           - UpstreamConnection is a small mutable dataclass owned by the
+             registry; ingest will mutate state via mark_connected /
+             mark_reconnecting / mark_disconnected as Step 5 lands.
 
 Step 5  — Coinbase ingestion (real)
   ingest/coinbase.py: WS client, demand-driven sub/unsub via registry callbacks.
