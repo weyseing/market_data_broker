@@ -6,8 +6,8 @@ STATUS
   [x] Step 1     — Scaffolding                         (done 2026-04-25)
   [x] Step 1.5   — Coinbase WS spike                   (done 2026-04-25)
   [x] Step 2     — Domain models & topic naming        (done 2026-04-25)
-  [ ] Step 3     — In-memory pub/sub bus                ← NEXT
-  [ ] Step 4     — Connection registry
+  [x] Step 3     — In-memory pub/sub bus                (done 2026-04-26)
+  [ ] Step 4     — Connection registry                  ← NEXT
   [ ] Step 5     — Coinbase ingestion (real)
   [ ] Step 6     — Snapshot store
   [ ] Step 7     — Downstream WebSocket server
@@ -73,10 +73,27 @@ Step 2  — Domain models & topic naming                                      [D
              heartbeat / error frames; ingest layer (Step 5) must filter those before
              calling.
 
-Step 3  — In-memory pub/sub bus
+Step 3  — In-memory pub/sub bus                                             [DONE]
   bus.py: InMemoryBus.publish / subscribe / unsubscribe.
   Bounded per-consumer queues, drop-oldest, drop counters.
   Verify: multi-consumer fan-out + slow-consumer + dynamic sub/unsub tests pass.
+  Outcome: 28 new tests green; full suite 83/83; ruff clean.
+           Decisions worth flagging:
+           - Subscription is the consumer handle (async-iterable, has its own
+             queue, dropped_messages counter). Bus owns routing tables;
+             Subscription delegates add_topic / remove_topic / close back to it.
+           - publish() is async-shaped but never yields — fan-out is atomic
+             w.r.t. other coroutines, so no locks. Keeps callers consistent
+             (`await bus.publish(msg)`).
+           - Drop-oldest implemented as get_nowait()+put_nowait() with the
+             counter incremented per drop. Bus does NOT close unhealthy subs —
+             that policy belongs in the registry (Step 4).
+           - Subscription is @dataclass(eq=False) so identity-hashing makes it
+             usable as a dict/set key — needed for the by-topic routing index.
+           - Per-subscription max_queue override kept (snapshots are ~50 KB
+             each — those subscribers will want bigger queues).
+           - Closed-but-non-empty subscriptions still drain on async-for, then
+             stop cleanly. Closed-and-empty raises SubscriptionClosedError.
 
 Step 4  — Connection registry
   registry.py: tracks upstream conns, downstream consumers, ref-counted (channel, product_id) → {consumer_ids}.
