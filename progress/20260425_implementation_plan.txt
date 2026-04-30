@@ -8,8 +8,8 @@ STATUS
   [x] Step 2     — Domain models & topic naming        (done 2026-04-25)
   [x] Step 3     — In-memory pub/sub bus                (done 2026-04-26)
   [x] Step 4     — Connection registry                  (done 2026-04-26)
-  [ ] Step 5     — Coinbase ingestion (real)            ← NEXT
-  [ ] Step 6     — Snapshot store
+  [x] Step 5     — Coinbase ingestion (real)            (done 2026-04-26)
+  [ ] Step 6     — Snapshot store                        ← NEXT
   [ ] Step 7     — Downstream WebSocket server
   [ ] Step 8     — MCP server (stdio + http)
   [ ] Step 9     — Context documentation in /docs
@@ -127,11 +127,44 @@ Step 4  — Connection registry                                              [DO
              registry; ingest will mutate state via mark_connected /
              mark_reconnecting / mark_disconnected as Step 5 lands.
 
-Step 5  — Coinbase ingestion (real)
+Step 5  — Coinbase ingestion (real)                                         [DONE]
   ingest/coinbase.py: WS client, demand-driven sub/unsub via registry callbacks.
   Lifecycle: connect → heartbeat watchdog → exp-backoff reconnect → re-subscribe live topics.
   Normalises raw → Message envelope → publishes to bus.
   Verify: fake-WS integration test (clean connect, reconnect, stale heartbeat) + manual run vs real Coinbase.
+  Outcome: 25 new tests green; full suite 140/140; ruff clean.
+           Manual run vs real Coinbase: ticker / matches / level2_batch all flow
+           end-to-end; 1 MB level2 snapshot parses cleanly (max_size=4 MiB fix);
+           SIGINT teardown sends unsubscribe per active channel.
+           Decisions worth flagging:
+           - Demand model: callbacks just mutate `_desired` and signal a
+             reconcile event; reconcile loop diffs `_desired` vs
+             `_active_upstream` and sends sub/unsub frames grouped by channel.
+             Keeps callbacks O(1) and lets the wire frames batch naturally.
+           - On (re)connect we clear `_active_upstream` (server has zero subs
+             after a fresh handshake) and signal reconcile → live set is
+             re-subscribed in one batch per channel. Standard Coinbase recipe.
+           - Two failure paths trigger reconnect: (a) WS-level errors caught in
+             the run loop, (b) application-level stale feed — watchdog forces
+             ws.close(code=1011) when no frame arrives within heartbeat_timeout.
+             Library ping/pong only catches dead TCP; stale-but-alive needs (b).
+           - Watchdog is dormant while `_desired` is empty — guards against an
+             idle hub busy-looping its own connection on startup.
+           - Connector is injectable (Callable[[], async-CM[WebSocketLike]]) so
+             tests substitute FakeWS without monkey-patching websockets. Default
+             connector is lazily-imported `websockets.connect` with max_size=4MiB.
+           - Backoff is exp 1→30s, reset on successful connect. Tests pass
+             tiny values (0.01s) to keep the suite under 1s.
+           - Registry is attached after construction (`attach_registry`) because
+             Registry takes the callbacks at __init__ → natural wiring is
+             ingest → registry(callbacks=ingest.on_*) → ingest.attach_registry.
+           - Control frames (subscriptions / heartbeat / error) and validation
+             failures are logged + dropped — one bad frame must not kill the
+             session. Receive loop is intentionally tolerant.
+           - __main__ now wires bus + registry + ingest end-to-end. Operators
+             can register a debug logging consumer via env var
+             MDB_DEBUG_SUBSCRIBE=coinbase.ticker.BTC-USD,... for manual smoke
+             tests until Step 7's WS server lands.
 
 Step 6  — Snapshot store
   snapshot.py: subscribes to bus internally; tracks last ticker, last trade, best bid/ask, last_update_ts per symbol.
