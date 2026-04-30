@@ -9,8 +9,8 @@ STATUS
   [x] Step 3     — In-memory pub/sub bus                (done 2026-04-26)
   [x] Step 4     — Connection registry                  (done 2026-04-26)
   [x] Step 5     — Coinbase ingestion (real)            (done 2026-04-26)
-  [ ] Step 6     — Snapshot store                        ← NEXT
-  [ ] Step 7     — Downstream WebSocket server
+  [x] Step 6     — Snapshot store                        (done 2026-05-01)
+  [ ] Step 7     — Downstream WebSocket server          ← NEXT
   [ ] Step 8     — MCP server (stdio + http)
   [ ] Step 9     — Context documentation in /docs
   [ ] Step 10    — Operational polish
@@ -166,9 +166,40 @@ Step 5  — Coinbase ingestion (real)                                         [D
              MDB_DEBUG_SUBSCRIBE=coinbase.ticker.BTC-USD,... for manual smoke
              tests until Step 7's WS server lands.
 
-Step 6  — Snapshot store
+Step 6  — Snapshot store                                                   [DONE]
   snapshot.py: subscribes to bus internally; tracks last ticker, last trade, best bid/ask, last_update_ts per symbol.
   Verify: synthetic-stream tests pass.
+  Outcome: 23 new tests green; full suite 163/163; ruff clean.
+           Decisions worth flagging:
+           - Snapshot store subscribes to the bus DIRECTLY, not through the
+             registry. Going via the registry would create artificial demand
+             and prevent ingest from ever unsubscribing upstream when real
+             downstream demand drops to zero. Pinned by
+             test_snapshot_store_does_not_create_registry_demand.
+           - Topic tracking is dynamic (track / untrack). Wired in __main__
+             by composing the registry's first/last callbacks: each transition
+             fans out to BOTH ingest (drives upstream sub/unsub) and the
+             snapshot store (starts/stops observing).
+           - Snapshot data is RETAINED after untrack — last known state is
+             still queryable while the topic is idle. last_update_at tells
+             callers how stale it is. The store is a cache, not a session;
+             stop()/start() preserves it too.
+           - Best bid/ask sourced from Ticker (top-of-book post-trade) AND
+             L2Snapshot (initial book on subscribe, sorted defensively).
+             L2Update only refreshes last_update_at — full book reconstruction
+             is out of scope for this hub.
+           - Snapshots are keyed by product_id only. Single venue today; if a
+             second venue is added that quotes the same product, the key
+             should grow to (venue, product_id). Documented in the module.
+           - Drain loop tolerates per-message _apply errors (logs + continues)
+             — same "one bad frame must not kill the session" posture as
+             ingest. Pinned by test_drain_continues_after_per_message_apply_error.
+           - to_dict serialises Decimal as strings (preserves precision) and
+             datetime as ISO-8601 — ready for the MCP get_snapshot tool to
+             return without further conversion.
+           - max_queue defaults to 4096 (vs the bus default 1000) because L2
+             snapshots are ~50 KB each and arrive in bursts on (re)subscribe;
+             slack avoids dropping fresh state before the drain loop catches up.
 
 Step 7  — Downstream WebSocket server
   server/ws.py: WS server for non-MCP consumers.

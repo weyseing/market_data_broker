@@ -24,6 +24,7 @@ from market_data_broker.bus import InMemoryBus
 from market_data_broker.ingest.coinbase import CoinbaseIngest
 from market_data_broker.logging_config import configure_logging, get_logger
 from market_data_broker.registry import Registry
+from market_data_broker.snapshot import SnapshotStore
 
 
 async def _debug_consumer(registry: Registry, topics: list[str]) -> None:
@@ -50,10 +51,24 @@ async def run() -> None:
 
     bus = InMemoryBus()
     ingest = CoinbaseIngest(bus=bus)
+    snapshot = SnapshotStore(bus)
+
+    # Compose: each topic transition fans out to both the ingest adapter
+    # (drives upstream sub/unsub) and the snapshot store (starts/stops
+    # observing the topic). Snapshot is a passive observer — it does NOT go
+    # through the registry, so it never pins a topic open against demand.
+    async def on_first(topic: str) -> None:
+        await ingest.on_first_subscriber(topic)
+        await snapshot.track(topic)
+
+    async def on_last(topic: str) -> None:
+        await ingest.on_last_unsubscriber(topic)
+        await snapshot.untrack(topic)
+
     registry = Registry(
         bus,
-        on_first_subscriber=ingest.on_first_subscriber,
-        on_last_unsubscriber=ingest.on_last_unsubscriber,
+        on_first_subscriber=on_first,
+        on_last_unsubscriber=on_last,
     )
     ingest.attach_registry(registry)
 
@@ -62,6 +77,9 @@ async def run() -> None:
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, stop.set)
 
+    # Start snapshot before ingest so the bus subscription is ready by the
+    # time the first frames flow.
+    await snapshot.start()
     await ingest.start()
 
     debug_topics_raw = os.environ.get("MDB_DEBUG_SUBSCRIBE", "").strip()
@@ -79,7 +97,10 @@ async def run() -> None:
             debug_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await debug_task
+        # Stop ingest first so no further messages are published, then drain
+        # the snapshot store cleanly.
         await ingest.stop()
+        await snapshot.stop()
         log.info("hub stopped")
 
 
