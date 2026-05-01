@@ -37,7 +37,7 @@ from market_data_broker.config import Config, ConfigError, load_config
 from market_data_broker.ingest.coinbase import CoinbaseIngest
 from market_data_broker.logging_config import configure_logging, get_logger
 from market_data_broker.registry import Registry
-from market_data_broker.server import DownstreamWSServer
+from market_data_broker.server import DownstreamWSServer, StatusHTTPServer
 from market_data_broker.snapshot import SnapshotStore
 
 
@@ -61,7 +61,7 @@ async def _debug_consumer(registry: Registry, topics: list[str]) -> None:
 
 async def run(cfg: Config) -> None:
     log = get_logger("hub")
-    log.info("hub starting", version="0.1.0")
+    log.info("hub.starting", version="0.1.0")
 
     bus = InMemoryBus(default_max_queue=cfg.bus.consumer_queue_size)
     ingest = CoinbaseIngest(
@@ -98,6 +98,11 @@ async def run(cfg: Config) -> None:
         port=cfg.ws_server.port,
         max_dropped_messages=cfg.bus.sustained_overflow_drops,
     )
+    status_server = StatusHTTPServer(
+        registry,
+        host=cfg.status_server.host,
+        port=cfg.status_server.port,
+    )
 
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -105,11 +110,12 @@ async def run(cfg: Config) -> None:
         loop.add_signal_handler(sig, stop.set)
 
     # Start snapshot before ingest so the bus subscription is ready by the
-    # time the first frames flow. WS server starts last — it's the public
-    # surface, so we want the inner layers ready before we accept clients.
+    # time the first frames flow. Public surfaces (WS, status HTTP) start
+    # last so inner layers are ready before we accept clients.
     await snapshot.start()
     await ingest.start()
     await ws_server.start()
+    await status_server.start()
 
     debug_topics_raw = os.environ.get("MDB_DEBUG_SUBSCRIBE", "").strip()
     debug_task: asyncio.Task[None] | None = None
@@ -117,22 +123,23 @@ async def run(cfg: Config) -> None:
         topics = [t.strip() for t in debug_topics_raw.split(",") if t.strip()]
         debug_task = asyncio.create_task(_debug_consumer(registry, topics))
 
-    log.info("hub ready")
+    log.info("hub.ready")
     try:
         await stop.wait()
     finally:
-        log.info("hub stopping")
+        log.info("hub.stopping")
         if debug_task is not None:
             debug_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await debug_task
-        # Tear down outermost first: stop accepting / disconnect WS clients,
+        # Tear down outermost first: close public surfaces (status HTTP, WS),
         # then ingest, then drain snapshot. Each layer's stop is idempotent
         # so partial-startup teardown is safe too.
+        await status_server.stop()
         await ws_server.stop()
         await ingest.stop()
         await snapshot.stop()
-        log.info("hub stopped")
+        log.info("hub.stopped")
 
 
 def main() -> None:
