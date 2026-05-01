@@ -18,6 +18,10 @@ Manual smoke tests against real Coinbase::
 Both routes share the same registry, so refcounts compose: ingest only holds
 the upstream subscription while at least one of {WS clients, debug consumer}
 still wants the topic. Ctrl+C exits cleanly.
+
+Runtime values (ports, URLs, timeouts, etc.) come from
+:func:`market_data_broker.config.load_config`. See ``.env.example`` for the
+full list of env-var overrides.
 """
 
 from __future__ import annotations
@@ -26,16 +30,15 @@ import asyncio
 import contextlib
 import os
 import signal
+import sys
 
 from market_data_broker.bus import InMemoryBus
+from market_data_broker.config import Config, ConfigError, load_config
 from market_data_broker.ingest.coinbase import CoinbaseIngest
 from market_data_broker.logging_config import configure_logging, get_logger
 from market_data_broker.registry import Registry
 from market_data_broker.server import DownstreamWSServer
 from market_data_broker.snapshot import SnapshotStore
-
-DEFAULT_WS_HOST = "0.0.0.0"
-DEFAULT_WS_PORT = 8765
 
 
 async def _debug_consumer(registry: Registry, topics: list[str]) -> None:
@@ -56,12 +59,18 @@ async def _debug_consumer(registry: Registry, topics: list[str]) -> None:
         await registry.unregister_consumer("debug-cli")
 
 
-async def run() -> None:
+async def run(cfg: Config) -> None:
     log = get_logger("hub")
     log.info("hub starting", version="0.1.0")
 
-    bus = InMemoryBus()
-    ingest = CoinbaseIngest(bus=bus)
+    bus = InMemoryBus(default_max_queue=cfg.bus.consumer_queue_size)
+    ingest = CoinbaseIngest(
+        bus=bus,
+        ws_url=cfg.coinbase.ws_url,
+        initial_backoff_seconds=cfg.coinbase.reconnect.initial_backoff_seconds,
+        max_backoff_seconds=cfg.coinbase.reconnect.max_backoff_seconds,
+        heartbeat_timeout_seconds=cfg.coinbase.heartbeat_timeout_seconds,
+    )
     snapshot = SnapshotStore(bus)
 
     # Compose: each topic transition fans out to both the ingest adapter
@@ -85,8 +94,9 @@ async def run() -> None:
 
     ws_server = DownstreamWSServer(
         registry,
-        host=os.environ.get("MDB_WS_HOST", DEFAULT_WS_HOST),
-        port=int(os.environ.get("MDB_WS_PORT", DEFAULT_WS_PORT)),
+        host=cfg.ws_server.host,
+        port=cfg.ws_server.port,
+        max_dropped_messages=cfg.bus.sustained_overflow_drops,
     )
 
     stop = asyncio.Event()
@@ -126,9 +136,15 @@ async def run() -> None:
 
 
 def main() -> None:
-    configure_logging(level=os.environ.get("LOG_LEVEL", "INFO"))
     try:
-        asyncio.run(run())
+        cfg = load_config()
+    except ConfigError as exc:
+        # Logging not configured yet; write to stderr so the operator sees it.
+        sys.stderr.write(f"config error: {exc}\n")
+        sys.exit(2)
+    configure_logging(level=cfg.log_level)
+    try:
+        asyncio.run(run(cfg))
     except KeyboardInterrupt:
         pass
 
