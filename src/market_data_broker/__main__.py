@@ -1,16 +1,23 @@
 """Entry point for ``python -m market_data_broker``.
 
-Wires bus + registry + Coinbase ingest. The downstream WS server (Step 7) and
-MCP server (Step 8) are not yet present, so this module also supports an
-operator-driven debug consumer for manual verification of the ingest path.
+Wires bus + registry + Coinbase ingest + downstream WebSocket server. The MCP
+server (Step 8) is still pending, so this module also supports an
+operator-driven debug consumer for manual verification of the ingest path
+without needing a WS client.
 
-Manual smoke test against real Coinbase::
+Manual smoke tests against real Coinbase::
 
+    # Logs every message at INFO directly from a registered consumer.
     MDB_DEBUG_SUBSCRIBE=coinbase.ticker.BTC-USD python -m market_data_broker
 
-Set ``MDB_DEBUG_SUBSCRIBE`` to a comma-separated list of topics to register a
-logging consumer that prints each received message at INFO level. Ctrl+C exits
-cleanly (registry tears down, ingest closes upstream WS).
+    # Connect a WS client (e.g. websocat) and drive subscriptions over the wire.
+    python -m market_data_broker
+    websocat ws://127.0.0.1:8765
+    > {"action":"subscribe","topics":["coinbase.ticker.BTC-USD"]}
+
+Both routes share the same registry, so refcounts compose: ingest only holds
+the upstream subscription while at least one of {WS clients, debug consumer}
+still wants the topic. Ctrl+C exits cleanly.
 """
 
 from __future__ import annotations
@@ -24,12 +31,16 @@ from market_data_broker.bus import InMemoryBus
 from market_data_broker.ingest.coinbase import CoinbaseIngest
 from market_data_broker.logging_config import configure_logging, get_logger
 from market_data_broker.registry import Registry
+from market_data_broker.server import DownstreamWSServer
 from market_data_broker.snapshot import SnapshotStore
+
+DEFAULT_WS_HOST = "0.0.0.0"
+DEFAULT_WS_PORT = 8765
 
 
 async def _debug_consumer(registry: Registry, topics: list[str]) -> None:
     """Register a consumer that logs every message it receives. Used for
-    manual end-to-end verification before the WS / MCP servers exist."""
+    manual end-to-end verification without needing a WS client."""
     log = get_logger("debug_consumer")
     sub = await registry.register_consumer("debug-cli", topics)
     log.info("debug_consumer.subscribed", topics=topics)
@@ -72,15 +83,23 @@ async def run() -> None:
     )
     ingest.attach_registry(registry)
 
+    ws_server = DownstreamWSServer(
+        registry,
+        host=os.environ.get("MDB_WS_HOST", DEFAULT_WS_HOST),
+        port=int(os.environ.get("MDB_WS_PORT", DEFAULT_WS_PORT)),
+    )
+
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, stop.set)
 
     # Start snapshot before ingest so the bus subscription is ready by the
-    # time the first frames flow.
+    # time the first frames flow. WS server starts last — it's the public
+    # surface, so we want the inner layers ready before we accept clients.
     await snapshot.start()
     await ingest.start()
+    await ws_server.start()
 
     debug_topics_raw = os.environ.get("MDB_DEBUG_SUBSCRIBE", "").strip()
     debug_task: asyncio.Task[None] | None = None
@@ -97,8 +116,10 @@ async def run() -> None:
             debug_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await debug_task
-        # Stop ingest first so no further messages are published, then drain
-        # the snapshot store cleanly.
+        # Tear down outermost first: stop accepting / disconnect WS clients,
+        # then ingest, then drain snapshot. Each layer's stop is idempotent
+        # so partial-startup teardown is safe too.
+        await ws_server.stop()
         await ingest.stop()
         await snapshot.stop()
         log.info("hub stopped")

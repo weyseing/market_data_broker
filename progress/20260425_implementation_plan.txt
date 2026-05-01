@@ -10,8 +10,8 @@ STATUS
   [x] Step 4     — Connection registry                  (done 2026-04-26)
   [x] Step 5     — Coinbase ingestion (real)            (done 2026-04-26)
   [x] Step 6     — Snapshot store                        (done 2026-05-01)
-  [ ] Step 7     — Downstream WebSocket server          ← NEXT
-  [ ] Step 8     — MCP server (stdio + http)
+  [x] Step 7     — Downstream WebSocket server          (done 2026-05-01)
+  [ ] Step 8     — MCP server (stdio + http)            ← NEXT
   [ ] Step 9     — Context documentation in /docs
   [ ] Step 10    — Operational polish
   [ ] Step 11    — Containerisation + architecture write-up
@@ -201,11 +201,49 @@ Step 6  — Snapshot store                                                   [DO
              snapshots are ~50 KB each and arrive in bursts on (re)subscribe;
              slack avoids dropping fresh state before the drain loop catches up.
 
-Step 7  — Downstream WebSocket server
+Step 7  — Downstream WebSocket server                                       [DONE]
   server/ws.py: WS server for non-MCP consumers.
   Protocol: {action: subscribe|unsubscribe, topics: [...]}.
   Each conn registered in registry, fed from bus, clean tear-down on disconnect.
   Verify: pytest test_ws_server.py passes; manual websocat shows live ticker.
+  Outcome: 22 new tests green; full suite 185/185; ruff clean.
+           Manual run vs real Coinbase (websocat unavailable, used a Python
+           client): two concurrent clients subscribed to ticker/matches BTC-USD
+           and ticker ETH-USD; live data flowed; on each client disconnect the
+           hub log showed the matching ingest.unsubscribe_sent for exactly the
+           topics that lost their last holder. Zero upstream subs after both
+           clients gone — the no-leaks guarantee verified end-to-end.
+           Decisions worth flagging:
+           - Wire frames are typed by ``kind`` (welcome / ack / error / data),
+             not by overloading a Coinbase-style ``type``. Keeps server-control
+             messages distinct from payload-level type discriminators that
+             already live inside ``data.payload.type``.
+           - Each WS connection is a registry consumer, not a bus subscriber.
+             Going through the registry is what makes the "disconnect →
+             upstream unsubscribes if last holder" property fall out for free
+             — pinned by test_disconnect_releases_topics_no_leak.
+           - Topic validation happens per-topic with ``parse_topic``, and one
+             bad topic in a batch returns a per-topic error frame but still
+             applies the valid ones. Friendlier for clients fixing typos and
+             keeps the session alive.
+           - Backpressure cap (``max_dropped_messages``, default 100) is the
+             "Sustained overflow → disconnect consumer with reason" hook from
+             the plan. Cumulative drops > threshold → backpressure_exceeded
+             error frame + close(1013). Defaults match config/default.yaml's
+             bus.sustained_overflow_drops; ``None`` disables (drop-oldest only).
+           - register_consumer / add_topic / remove_topic failures inside the
+             recv loop are caught and surfaced as ``{action}_failed`` error
+             frames with the offending topic. An ingest hiccup must not tear
+             down a healthy WS session.
+           - Welcome frame includes the assigned ``consumer_id`` so the client
+             can correlate its own logs with hub /status output.
+           - Server stop closes the listener AND every in-flight handler;
+             handler ``finally`` blocks unregister consumers, which fires
+             on_last_unsubscriber for any topic this client was the last
+             holder of. Pinned by test_server_stop_closes_active_connections.
+           - WS server starts after ingest + snapshot in __main__ — public
+             surface goes up only once the inner layers are ready to accept
+             demand. Stop order is the mirror: WS first, ingest, snapshot.
 
 Step 8  — MCP server
   server/mcp_server.py with FastMCP. Tools (LLM-first names + descriptions):
