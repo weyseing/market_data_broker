@@ -115,14 +115,27 @@ def load_config(
 ) -> Config:
     """Load YAML, apply env-var overrides, validate against :class:`Config`.
 
-    ``yaml_path`` defaults to ``config/default.yaml`` at the repo root. The
-    file is required — its absence is a hard error because it ships in the
-    repo. Tests can pass any path.
+    YAML path resolution (first match wins):
+
+    1. The ``yaml_path`` argument, if provided.
+    2. The ``MDB_CONFIG_PATH`` environment variable. Used by the Docker image
+       to point at ``/app/config/default.yaml`` since the package isn't
+       installed at the repo root inside the container.
+    3. ``config/default.yaml`` at the repo root (the dev default).
+
+    The file is required — its absence is a hard error because it ships with
+    the project. Tests can pass any path.
 
     ``env`` lets tests inject a fake environment; production callers use
     ``os.environ`` (the default).
     """
-    path = yaml_path if yaml_path is not None else DEFAULT_CONFIG_PATH
+    env_dict: Mapping[str, str] = env if env is not None else os.environ
+    if yaml_path is not None:
+        path = yaml_path
+    elif env_path := env_dict.get("MDB_CONFIG_PATH"):
+        path = Path(env_path)
+    else:
+        path = DEFAULT_CONFIG_PATH
     if not path.exists():
         raise ConfigError(f"config file not found: {path}")
     try:
@@ -138,7 +151,6 @@ def load_config(
             f"yaml root in {path} must be a mapping, got {type(raw).__name__}"
         )
 
-    env_dict: Mapping[str, str] = env if env is not None else os.environ
     for var, dotted in _ENV_OVERRIDES:
         if var in env_dict:
             _set_nested(raw, dotted, env_dict[var])

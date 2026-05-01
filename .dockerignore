@@ -1,0 +1,25 @@
+# Build context exclusions — keeps `docker build` snappy and out-of-band
+# files out of the image.
+
+.venv/
+.git/
+.github/
+.pytest_cache/
+.ruff_cache/
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+
+# Tests don't need to ship with the image (they import from src/, but the
+# runtime image isn't a test target).
+tests/
+
+# Dev / docs that aren't useful at runtime.
+progress/
+docs/
+.claude/
+
+# Local env files. Never ship secrets in an image.
+.env
+.env.local

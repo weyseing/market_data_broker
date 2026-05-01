@@ -1,0 +1,33 @@
+# docker-compose.yml — single-service local deployment.
+#
+# Usage:
+#   docker compose up --build         # build + run
+#   docker compose down               # stop + remove
+#   curl http://localhost:8080/status # while running
+#
+# Env-var overrides go in the `environment:` block below or in a .env file
+# at the repo root (compose auto-loads .env into substitutions).
+
+services:
+  hub:
+    build: .
+    image: market-data-broker:latest
+    container_name: market-data-broker
+    ports:
+      - "8765:8765"   # downstream WebSocket
+      - "8080:8080"   # HTTP /status + /healthz
+    # Pass every key in .env directly into the container. Optional — if .env
+    # doesn't exist, defaults from config/default.yaml apply (incl. binding
+    # to 0.0.0.0 so Docker's port mapping reaches the listener).
+    env_file:
+      - path: .env
+        required: false
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - |
+          python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8080/healthz', timeout=3).getcode()==200 else 1)"
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3

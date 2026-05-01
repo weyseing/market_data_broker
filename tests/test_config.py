@@ -134,6 +134,22 @@ def test_unrelated_env_vars_ignored(tmp_path: Path) -> None:
     assert cfg == Config()
 
 
+def test_mdb_config_path_env_resolves_yaml_location(tmp_path: Path) -> None:
+    """MDB_CONFIG_PATH lets the Docker image point at a non-repo-root config."""
+    p = _write_yaml(tmp_path, "log_level: WARNING\n")
+    cfg = load_config(env={"MDB_CONFIG_PATH": str(p)})
+    assert cfg.log_level == "WARNING"
+
+
+def test_explicit_yaml_path_overrides_mdb_config_path(tmp_path: Path) -> None:
+    """When both are present, the explicit argument wins (tests pass it)."""
+    explicit = _write_yaml(tmp_path, "log_level: DEBUG\n")
+    other = tmp_path / "other.yaml"
+    other.write_text("log_level: ERROR\n")
+    cfg = load_config(explicit, env={"MDB_CONFIG_PATH": str(other)})
+    assert cfg.log_level == "DEBUG"
+
+
 # ---------------------------------------------------------------------------
 # Failure modes
 # ---------------------------------------------------------------------------

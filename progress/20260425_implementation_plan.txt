@@ -11,10 +11,11 @@ STATUS
   [x] Step 5     — Coinbase ingestion (real)            (done 2026-04-26)
   [x] Step 6     — Snapshot store                        (done 2026-05-01)
   [x] Step 7     — Downstream WebSocket server          (done 2026-05-01)
-  [ ] Step 8     — MCP server (stdio + http)            ← NEXT
-  [ ] Step 9     — Context documentation in /docs
-  [ ] Step 10    — Operational polish
-  [ ] Step 11    — Containerisation + architecture write-up
+  [ ] Step 8     — MCP server (stdio + http)            ← deferred (resume later)
+  [~] Step 9     — Context documentation in /docs       (3 of 4 docs landed 2026-05-01;
+                                                         worked_examples.md awaits Step 8)
+  [x] Step 10    — Operational polish                   (done 2026-05-01)
+  [x] Step 11    — Containerisation + architecture write-up  (done 2026-05-01)
 
 STACK
 - Python 3.11+, asyncio

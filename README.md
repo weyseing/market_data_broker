@@ -128,9 +128,28 @@ MDB_DEBUG_SUBSCRIBE=coinbase.ticker.BTC-USD ./scripts/start.sh
 set -a; source .env; set +a; ./scripts/start.sh
 ```
 
-### Docker (Step 11 — pending)
+### Docker
 
-A Dockerfile + docker-compose.yml will land in Step 11.
+```bash
+./scripts/start.sh --docker
+```
+
+Builds the image (multi-stage, ~80 MB) and runs the container in the
+foreground via `docker compose up --build`. Ports 8765 + 8080 are published
+to the host, so `curl http://localhost:8080/status` and
+`scripts/smoke_ws_client.py` work the same as in local mode.
+
+Ctrl+C tears the container down cleanly. Manual control:
+
+```bash
+docker compose up -d        # detached
+docker compose logs -f      # tail logs
+docker compose ps           # health status
+docker compose down         # stop and remove
+```
+
+The image healthcheck pings `/healthz` every 30s; `docker ps` shows the
+container as `healthy` once the hub is up.
 
 ---
 
