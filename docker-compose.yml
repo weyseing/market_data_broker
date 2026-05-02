@@ -1,18 +1,27 @@
-# docker-compose.yml — single-service local deployment.
+# docker-compose.yml — local deployment for the market-data-broker.
 #
-# Usage:
-#   docker compose up --build         # build + run
-#   docker compose down               # stop + remove
-#   curl http://localhost:8080/status # while running
+# Two services:
+#   - hub: Coinbase ingest + downstream WebSocket (8765) + /status HTTP (8080).
+#   - mcp: MCP server over streamable-HTTP (8000) for LLM agents.
 #
-# Env-var overrides go in the `environment:` block below or in a .env file
-# at the repo root (compose auto-loads .env into substitutions).
+# Each service runs its own ingest + bus + snapshot — they are independent
+# processes, not a shared core. Use `./scripts/start.sh --docker [hub|mcp|all]`
+# to bring up the right combination; raw compose commands also work:
+#
+#   docker compose up --build hub        # hub only (current default)
+#   docker compose up --build mcp        # mcp only
+#   docker compose up --build            # both
+#   docker compose down                  # stop + remove
+#   curl http://localhost:8080/status    # hub status while running
+#
+# Env-var overrides go in a .env file at the repo root (compose auto-loads
+# .env into substitutions). See .env.example.
 
 services:
   hub:
     build: .
     image: market-data-broker:latest
-    container_name: market-data-broker
+    container_name: market-data-broker-hub
     ports:
       - "8765:8765"   # downstream WebSocket
       - "8080:8080"   # HTTP /status + /healthz
@@ -31,3 +40,18 @@ services:
       timeout: 5s
       start_period: 10s
       retries: 3
+
+  mcp:
+    build: .
+    image: market-data-broker:latest
+    container_name: market-data-broker-mcp
+    # MCP over streamable-HTTP. Bind to 0.0.0.0 so the published port reaches
+    # the listener — 127.0.0.1 inside the container is unreachable from the
+    # host. stdio transport is not exposed via Docker (it expects to be spawned
+    # by a parent process like Claude Desktop).
+    command: ["mcp", "--http", "--host", "0.0.0.0", "--port", "8000"]
+    ports:
+      - "8000:8000"   # MCP streamable-HTTP
+    env_file:
+      - path: .env
+        required: false
