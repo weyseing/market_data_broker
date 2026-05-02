@@ -1,0 +1,2173 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+
+<title>Market Data Broker — Demo</title>
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A//www.w3.org/2000/svg%22%20viewBox%3D%220%200%2032%2032%22%3E%3Cdefs%3E%3ClinearGradient%20id%3D%22g%22%20x1%3D%220%22%20y1%3D%220%22%20x2%3D%221%22%20y2%3D%221%22%3E%3Cstop%20offset%3D%220%25%22%20stop-color%3D%22%237fb6ff%22/%3E%3Cstop%20offset%3D%2250%25%22%20stop-color%3D%22%23b59bff%22/%3E%3Cstop%20offset%3D%22100%25%22%20stop-color%3D%22%23f0a8d0%22/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect%20width%3D%2232%22%20height%3D%2232%22%20rx%3D%227%22%20fill%3D%22%230a3d33%22/%3E%3Ctext%20x%3D%2216%22%20y%3D%2222.5%22%20font-family%3D%22Inter%2Csystem-ui%2Csans-serif%22%20font-size%3D%2220%22%20font-weight%3D%22800%22%20fill%3D%22url%28%23g%29%22%20text-anchor%3D%22middle%22%3E8%3C/text%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin="">
+<style></style>
+<script>
+/**
+ * <deck-stage> — reusable web component for HTML decks.
+ *
+ * Handles:
+ *  (a) speaker notes — reads <script type="application/json" id="speaker-notes">
+ *      and posts {slideIndexChanged: N} to the parent window on nav.
+ *  (b) keyboard navigation — ←/→, PgUp/PgDn, Space, Home/End, number keys.
+ *  (c) press R to reset to slide 0 (with a tasteful keyboard hint).
+ *  (d) bottom-center overlay showing slide count + hints, fades out on idle.
+ *  (e) auto-scaling — inner canvas is a fixed design size (default 1920×1080)
+ *      scaled with `transform: scale()` to fit the viewport, letterboxed.
+ *      Set the `noscale` attribute to render at authored size (1:1) — the
+ *      PPTX exporter sets this so its DOM capture sees unscaled geometry.
+ *  (f) print — `@media print` lays every slide out as its own page at the
+ *      design size, so the browser's Print → Save as PDF produces a clean
+ *      one-page-per-slide PDF with no extra setup.
+ *
+ * Slides are HIDDEN, not unmounted. Non-active slides stay in the DOM with
+ * `visibility: hidden` + `opacity: 0`, so their state (videos, iframes,
+ * form inputs, React trees) is preserved across navigation.
+ *
+ * Lifecycle event — the component dispatches a `slidechange` CustomEvent on
+ * itself whenever the active slide changes (including the initial mount).
+ * The event bubbles and composes out of shadow DOM, so you can listen on
+ * the <deck-stage> element or on document:
+ *
+ *   document.querySelector('deck-stage').addEventListener('slidechange', (e) => {
+ *     e.detail.index         // new 0-based index
+ *     e.detail.previousIndex // previous index, or -1 on init
+ *     e.detail.total         // total slide count
+ *     e.detail.slide         // the new active slide element
+ *     e.detail.previousSlide // the prior slide element, or null on init
+ *     e.detail.reason        // 'init' | 'keyboard' | 'click' | 'tap' | 'api'
+ *   });
+ *
+ * Persistence: none at the deck level. The host app keeps the current slide
+ * in its own URL (?slide=) and re-delivers it via location.hash on load, so a
+ * bare load with no hash always starts at slide 1.
+ *
+ * Usage:
+ *   <deck-stage width="1920" height="1080">
+ *     <section data-label="Title">...</section>
+ *     <section data-label="Agenda">...</section>
+ *   </deck-stage>
+ *
+ * Slides are the direct element children of <deck-stage>. Each slide is
+ * automatically tagged with:
+ *   - data-screen-label="NN Label"   (1-indexed, for comment flow)
+ *   - data-om-validate="no_overflowing_text,no_overlapping_text,slide_sized_text"
+ */
+
+(() => {
+  const DESIGN_W_DEFAULT = 1920;
+  const DESIGN_H_DEFAULT = 1080;
+  const OVERLAY_HIDE_MS = 1800;
+  const VALIDATE_ATTR = 'no_overflowing_text,no_overlapping_text,slide_sized_text';
+
+  const pad2 = (n) => String(n).padStart(2, '0');
+
+  const stylesheet = `
+    :host {
+      position: fixed;
+      inset: 0;
+      display: block;
+      background: #000;
+      color: #fff;
+      font-family: -apple-system, BlinkMacSystemFont, "Helvetica Neue", Helvetica, Arial, sans-serif;
+      overflow: hidden;
+    }
+
+    .stage {
+      position: absolute;
+      inset: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .canvas {
+      position: relative;
+      transform-origin: center center;
+      flex-shrink: 0;
+      background: #fff;
+      will-change: transform;
+    }
+
+    /* Slides live in light DOM (via <slot>) so authored CSS still applies.
+       We absolutely position each slotted child to stack them. */
+    ::slotted(*) {
+      position: absolute !important;
+      inset: 0 !important;
+      width: 100% !important;
+      height: 100% !important;
+      box-sizing: border-box !important;
+      overflow: hidden;
+      opacity: 0;
+      pointer-events: none;
+      visibility: hidden;
+    }
+    ::slotted([data-deck-active]) {
+      opacity: 1;
+      pointer-events: auto;
+      visibility: visible;
+    }
+
+    /* Tap zones for mobile — back/forward thirds like Stories.
+       Transparent, no visible UI, don't block the overlay. */
+    .tapzones {
+      position: fixed;
+      inset: 0;
+      display: flex;
+      z-index: 2147482000;
+      pointer-events: none;
+    }
+    .tapzone {
+      flex: 1;
+      pointer-events: auto;
+      -webkit-tap-highlight-color: transparent;
+    }
+    /* Only activate tap zones on coarse pointers (touch devices). */
+    @media (hover: hover) and (pointer: fine) {
+      .tapzones { display: none; }
+    }
+
+    .overlay {
+      position: fixed;
+      left: 50%;
+      bottom: 22px;
+      transform: translate(-50%, 6px) scale(0.92);
+      filter: blur(6px);
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      padding: 4px;
+      background: #000;
+      color: #fff;
+      border-radius: 999px;
+      font-size: 12px;
+      font-feature-settings: "tnum" 1;
+      letter-spacing: 0.01em;
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 260ms ease, transform 260ms cubic-bezier(.2,.8,.2,1), filter 260ms ease;
+      transform-origin: center bottom;
+      z-index: 2147483000;
+      user-select: none;
+    }
+    .overlay[data-visible] {
+      opacity: 1;
+      pointer-events: auto;
+      transform: translate(-50%, 0) scale(1);
+      filter: blur(0);
+    }
+
+    .btn {
+      appearance: none;
+      -webkit-appearance: none;
+      background: transparent;
+      border: 0;
+      margin: 0;
+      padding: 0;
+      color: inherit;
+      font: inherit;
+      cursor: default;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      height: 28px;
+      min-width: 28px;
+      border-radius: 999px;
+      color: rgba(255,255,255,0.72);
+      transition: background 140ms ease, color 140ms ease;
+      -webkit-tap-highlight-color: transparent;
+    }
+    .btn:hover { background: rgba(255,255,255,0.12); color: #fff; }
+    .btn:active { background: rgba(255,255,255,0.18); }
+    .btn:focus { outline: none; }
+    .btn:focus-visible { outline: none; }
+    .btn::-moz-focus-inner { border: 0; }
+    .btn svg { width: 14px; height: 14px; display: block; }
+    .btn.reset {
+      font-size: 11px;
+      font-weight: 500;
+      letter-spacing: 0.02em;
+      padding: 0 10px 0 12px;
+      gap: 6px;
+      color: rgba(255,255,255,0.72);
+    }
+    .btn.reset .kbd {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 16px;
+      height: 16px;
+      padding: 0 4px;
+      font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+      font-size: 10px;
+      line-height: 1;
+      color: rgba(255,255,255,0.88);
+      background: rgba(255,255,255,0.12);
+      border-radius: 4px;
+    }
+
+    .count {
+      font-variant-numeric: tabular-nums;
+      color: #fff;
+      font-weight: 500;
+      padding: 0 8px;
+      min-width: 42px;
+      text-align: center;
+      font-size: 12px;
+    }
+    .count .sep { color: rgba(255,255,255,0.45); margin: 0 3px; font-weight: 400; }
+    .count .total { color: rgba(255,255,255,0.55); }
+
+    .divider {
+      width: 1px;
+      height: 14px;
+      background: rgba(255,255,255,0.18);
+      margin: 0 2px;
+    }
+
+    /* ── Print: one page per slide, no chrome ────────────────────────────
+       The screen layout stacks every slide at inset:0 inside a scaled
+       canvas; for print we want them in document flow at the authored
+       design size so the browser paginates one slide per sheet. The
+       @page size is set from the width/height attributes via the inline
+       <style id="deck-stage-print-page"> that connectedCallback injects
+       into <head> (the @page at-rule has no effect inside shadow DOM). */
+    @media print {
+      :host {
+        position: static;
+        inset: auto;
+        background: none;
+        overflow: visible;
+        color: inherit;
+      }
+      .stage { position: static; display: block; }
+      .canvas {
+        transform: none !important;
+        width: auto !important;
+        height: auto !important;
+        background: none;
+        will-change: auto;
+      }
+      ::slotted(*) {
+        position: relative !important;
+        inset: auto !important;
+        width: var(--deck-design-w) !important;
+        height: var(--deck-design-h) !important;
+        box-sizing: border-box !important;
+        opacity: 1 !important;
+        visibility: visible !important;
+        pointer-events: auto;
+        break-after: page;
+        page-break-after: always;
+        break-inside: avoid;
+        overflow: hidden;
+      }
+      ::slotted(*:last-child) {
+        break-after: auto;
+        page-break-after: auto;
+      }
+      .overlay, .tapzones { display: none !important; }
+    }
+  `;
+
+  class DeckStage extends HTMLElement {
+    static get observedAttributes() { return ['width', 'height', 'noscale']; }
+
+    constructor() {
+      super();
+      this._root = this.attachShadow({ mode: 'open' });
+      this._index = 0;
+      this._slides = [];
+      this._notes = [];
+      this._hideTimer = null;
+      this._mouseIdleTimer = null;
+
+      this._onKey = this._onKey.bind(this);
+      this._onResize = this._onResize.bind(this);
+      this._onSlotChange = this._onSlotChange.bind(this);
+      this._onMouseMove = this._onMouseMove.bind(this);
+      this._onTapBack = this._onTapBack.bind(this);
+      this._onTapForward = this._onTapForward.bind(this);
+    }
+
+    get designWidth() {
+      return parseInt(this.getAttribute('width'), 10) || DESIGN_W_DEFAULT;
+    }
+    get designHeight() {
+      return parseInt(this.getAttribute('height'), 10) || DESIGN_H_DEFAULT;
+    }
+
+    connectedCallback() {
+      this._render();
+      this._loadNotes();
+      this._syncPrintPageRule();
+      window.addEventListener('keydown', this._onKey);
+      window.addEventListener('resize', this._onResize);
+      window.addEventListener('mousemove', this._onMouseMove, { passive: true });
+      // Initial collection + layout happens via slotchange, which fires on mount.
+    }
+
+    disconnectedCallback() {
+      window.removeEventListener('keydown', this._onKey);
+      window.removeEventListener('resize', this._onResize);
+      window.removeEventListener('mousemove', this._onMouseMove);
+      if (this._hideTimer) clearTimeout(this._hideTimer);
+      if (this._mouseIdleTimer) clearTimeout(this._mouseIdleTimer);
+    }
+
+    attributeChangedCallback() {
+      if (this._canvas) {
+        this._canvas.style.width = this.designWidth + 'px';
+        this._canvas.style.height = this.designHeight + 'px';
+        this._canvas.style.setProperty('--deck-design-w', this.designWidth + 'px');
+        this._canvas.style.setProperty('--deck-design-h', this.designHeight + 'px');
+        this._fit();
+        this._syncPrintPageRule();
+      }
+    }
+
+    _render() {
+      const style = document.createElement('style');
+      style.textContent = stylesheet;
+
+      const stage = document.createElement('div');
+      stage.className = 'stage';
+
+      const canvas = document.createElement('div');
+      canvas.className = 'canvas';
+      canvas.style.width = this.designWidth + 'px';
+      canvas.style.height = this.designHeight + 'px';
+      canvas.style.setProperty('--deck-design-w', this.designWidth + 'px');
+      canvas.style.setProperty('--deck-design-h', this.designHeight + 'px');
+
+      const slot = document.createElement('slot');
+      slot.addEventListener('slotchange', this._onSlotChange);
+      canvas.appendChild(slot);
+      stage.appendChild(canvas);
+
+      // Tap zones (mobile): left third = back, right third = forward.
+      const tapzones = document.createElement('div');
+      tapzones.className = 'tapzones export-hidden';
+      tapzones.setAttribute('aria-hidden', 'true');
+      tapzones.setAttribute('data-noncommentable', '');
+      const tzBack = document.createElement('div');
+      tzBack.className = 'tapzone tapzone--back';
+      const tzMid = document.createElement('div');
+      tzMid.className = 'tapzone tapzone--mid';
+      tzMid.style.pointerEvents = 'none';
+      const tzFwd = document.createElement('div');
+      tzFwd.className = 'tapzone tapzone--fwd';
+      tzBack.addEventListener('click', this._onTapBack);
+      tzFwd.addEventListener('click', this._onTapForward);
+      tapzones.append(tzBack, tzMid, tzFwd);
+
+      // Overlay: compact, solid black, with clickable controls.
+      const overlay = document.createElement('div');
+      overlay.className = 'overlay export-hidden';
+      overlay.setAttribute('role', 'toolbar');
+      overlay.setAttribute('aria-label', 'Deck controls');
+      overlay.setAttribute('data-noncommentable', '');
+      overlay.innerHTML = `
+        <button class="btn prev" type="button" aria-label="Previous slide" title="Previous (←)">
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10 3L5 8l5 5"/></svg>
+        </button>
+        <span class="count" aria-live="polite"><span class="current">1</span><span class="sep">/</span><span class="total">1</span></span>
+        <button class="btn next" type="button" aria-label="Next slide" title="Next (→)">
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 3l5 5-5 5"/></svg>
+        </button>
+        <span class="divider"></span>
+        <button class="btn reset" type="button" aria-label="Reset to first slide" title="Reset (R)">Reset<span class="kbd">R</span></button>
+      `;
+
+      overlay.querySelector('.prev').addEventListener('click', () => this._go(this._index - 1, 'click'));
+      overlay.querySelector('.next').addEventListener('click', () => this._go(this._index + 1, 'click'));
+      overlay.querySelector('.reset').addEventListener('click', () => this._go(0, 'click'));
+
+      this._root.append(style, stage, tapzones, overlay);
+      this._canvas = canvas;
+      this._slot = slot;
+      this._overlay = overlay;
+      this._countEl = overlay.querySelector('.current');
+      this._totalEl = overlay.querySelector('.total');
+    }
+
+    /** @page must live in the document stylesheet — it's a no-op inside
+     *  shadow DOM. Inject/update a single <head> style tag so the print
+     *  sheet matches the design size and Save-as-PDF yields one slide per
+     *  page with no margins. */
+    _syncPrintPageRule() {
+      const id = 'deck-stage-print-page';
+      let tag = document.getElementById(id);
+      if (!tag) {
+        tag = document.createElement('style');
+        tag.id = id;
+        document.head.appendChild(tag);
+      }
+      tag.textContent =
+        '@page { size: ' + this.designWidth + 'px ' + this.designHeight + 'px; margin: 0; } ' +
+        '@media print { html, body { margin: 0 !important; padding: 0 !important; background: none !important; overflow: visible !important; height: auto !important; } ' +
+        '* { -webkit-print-color-adjust: exact; print-color-adjust: exact; } }';
+    }
+
+    _onSlotChange() {
+      this._collectSlides();
+      this._restoreIndex();
+      this._applyIndex({ showOverlay: false, broadcast: true, reason: 'init' });
+      this._fit();
+    }
+
+    _collectSlides() {
+      const assigned = this._slot.assignedElements({ flatten: true });
+      this._slides = assigned.filter((el) => {
+        // Skip template/style/script nodes even if someone slots them.
+        const tag = el.tagName;
+        return tag !== 'TEMPLATE' && tag !== 'SCRIPT' && tag !== 'STYLE';
+      });
+
+      this._slides.forEach((slide, i) => {
+        const n = i + 1;
+        // Determine a label for comment flow: prefer explicit data-label,
+        // then an existing data-screen-label, then first heading, else "Slide".
+        let label = slide.getAttribute('data-label');
+        if (!label) {
+          const existing = slide.getAttribute('data-screen-label');
+          if (existing) {
+            // Strip any leading number the author may have included.
+            label = existing.replace(/^\s*\d+\s*/, '').trim() || existing;
+          }
+        }
+        if (!label) {
+          const h = slide.querySelector('h1, h2, h3, [data-title]');
+          if (h) label = (h.textContent || '').trim().slice(0, 40);
+        }
+        if (!label) label = 'Slide';
+        slide.setAttribute('data-screen-label', `${pad2(n)} ${label}`);
+
+        // Validation attribute for comment flow / auto-checks.
+        if (!slide.hasAttribute('data-om-validate')) {
+          slide.setAttribute('data-om-validate', VALIDATE_ATTR);
+        }
+
+        slide.setAttribute('data-deck-slide', String(i));
+      });
+
+      if (this._totalEl) this._totalEl.textContent = String(this._slides.length || 1);
+      if (this._index >= this._slides.length) this._index = Math.max(0, this._slides.length - 1);
+    }
+
+    _loadNotes() {
+      const tag = document.getElementById('speaker-notes');
+      if (!tag) { this._notes = []; return; }
+      try {
+        const parsed = JSON.parse(tag.textContent || '[]');
+        if (Array.isArray(parsed)) this._notes = parsed;
+      } catch (e) {
+        console.warn('[deck-stage] Failed to parse #speaker-notes JSON:', e);
+        this._notes = [];
+      }
+    }
+
+    _restoreIndex() {
+      // The host's ?slide= param is delivered as a #<int> hash (1-indexed) on
+      // the iframe src. No hash → slide 1; the deck itself keeps no position
+      // state across loads.
+      const h = (location.hash || '').match(/^#(\d+)$/);
+      if (h) {
+        const n = parseInt(h[1], 10) - 1;
+        if (n >= 0 && n < this._slides.length) this._index = n;
+      }
+    }
+
+    _applyIndex({ showOverlay = true, broadcast = true, reason = 'init' } = {}) {
+      if (!this._slides.length) return;
+      const prev = this._prevIndex == null ? -1 : this._prevIndex;
+      const curr = this._index;
+      // Keep the iframe's own hash in sync so an in-iframe location.reload()
+      // (reload banner path in viewer-handle.ts) lands on the current slide,
+      // not the stale deep-link hash from initial load.
+      try { history.replaceState(null, '', '#' + (curr + 1)); } catch (e) {}
+      this._slides.forEach((s, i) => {
+        if (i === curr) s.setAttribute('data-deck-active', '');
+        else s.removeAttribute('data-deck-active');
+      });
+      if (this._countEl) this._countEl.textContent = String(curr + 1);
+
+      if (broadcast) {
+        // (1) Legacy: host-window postMessage for speaker-notes renderers.
+        try { window.postMessage({ slideIndexChanged: curr }, '*'); } catch (e) {}
+
+        // (2) In-page CustomEvent on the <deck-stage> element itself.
+        //     Bubbles and composes out of shadow DOM so slide code can listen:
+        //       document.querySelector('deck-stage').addEventListener('slidechange', e => {
+        //         e.detail.index, e.detail.previousIndex, e.detail.total, e.detail.slide, e.detail.reason
+        //       });
+        const detail = {
+          index: curr,
+          previousIndex: prev,
+          total: this._slides.length,
+          slide: this._slides[curr] || null,
+          previousSlide: prev >= 0 ? (this._slides[prev] || null) : null,
+          reason: reason, // 'init' | 'keyboard' | 'click' | 'tap' | 'api'
+        };
+        this.dispatchEvent(new CustomEvent('slidechange', {
+          detail,
+          bubbles: true,
+          composed: true,
+        }));
+      }
+
+      this._prevIndex = curr;
+      if (showOverlay) this._flashOverlay();
+    }
+
+    _flashOverlay() {
+      if (!this._overlay) return;
+      this._overlay.setAttribute('data-visible', '');
+      if (this._hideTimer) clearTimeout(this._hideTimer);
+      this._hideTimer = setTimeout(() => {
+        this._overlay.removeAttribute('data-visible');
+      }, OVERLAY_HIDE_MS);
+    }
+
+    _fit() {
+      if (!this._canvas) return;
+      // PPTX export sets noscale so the DOM capture sees authored-size
+      // geometry — the scaled canvas is in shadow DOM, so the exporter's
+      // resetTransformSelector can't reach .canvas.style.transform directly.
+      if (this.hasAttribute('noscale')) {
+        this._canvas.style.transform = 'none';
+        return;
+      }
+      const vw = window.innerWidth;
+      const vh = window.innerHeight;
+      const s = Math.min(vw / this.designWidth, vh / this.designHeight);
+      this._canvas.style.transform = `scale(${s})`;
+    }
+
+    _onResize() { this._fit(); }
+
+    _onMouseMove() {
+      // Keep overlay visible while mouse moves; hide after idle.
+      this._flashOverlay();
+    }
+
+    _onTapBack(e) {
+      e.preventDefault();
+      this._go(this._index - 1, 'tap');
+    }
+
+    _onTapForward(e) {
+      e.preventDefault();
+      this._go(this._index + 1, 'tap');
+    }
+
+    _onKey(e) {
+      // Ignore when the user is typing.
+      const t = e.target;
+      if (t && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName))) return;
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
+
+      const key = e.key;
+      let handled = true;
+
+      if (key === 'ArrowRight' || key === 'PageDown' || key === ' ' || key === 'Spacebar') {
+        this._go(this._index + 1, 'keyboard');
+      } else if (key === 'ArrowLeft' || key === 'PageUp') {
+        this._go(this._index - 1, 'keyboard');
+      } else if (key === 'Home') {
+        this._go(0, 'keyboard');
+      } else if (key === 'End') {
+        this._go(this._slides.length - 1, 'keyboard');
+      } else if (key === 'r' || key === 'R') {
+        this._go(0, 'keyboard');
+      } else if (/^[0-9]$/.test(key)) {
+        // 1..9 jump to that slide; 0 jumps to 10.
+        const n = key === '0' ? 9 : parseInt(key, 10) - 1;
+        if (n < this._slides.length) this._go(n, 'keyboard');
+      } else {
+        handled = false;
+      }
+
+      if (handled) {
+        e.preventDefault();
+        this._flashOverlay();
+      }
+    }
+
+    _go(i, reason = 'api') {
+      if (!this._slides.length) return;
+      const clamped = Math.max(0, Math.min(this._slides.length - 1, i));
+      if (clamped === this._index) {
+        this._flashOverlay();
+        return;
+      }
+      this._index = clamped;
+      this._applyIndex({ showOverlay: true, broadcast: true, reason });
+    }
+
+    // Public API ------------------------------------------------------------
+
+    /** Current slide index (0-based). */
+    get index() { return this._index; }
+    /** Total slide count. */
+    get length() { return this._slides.length; }
+    /** Programmatically navigate. */
+    goTo(i) { this._go(i, 'api'); }
+    next() { this._go(this._index + 1, 'api'); }
+    prev() { this._go(this._index - 1, 'api'); }
+    reset() { this._go(0, 'api'); }
+  }
+
+  if (!customElements.get('deck-stage')) {
+    customElements.define('deck-stage', DeckStage);
+  }
+})();
+
+</script>
+
+<style>
+  :root {
+    /* Dark green marketing palette (original — inspired by general dark-green product pages) */
+    --bg:          #0a3d33;
+    --bg-deep:     #062a23;
+    --panel:       #0e5c4a;
+    --panel-2:     #11705a;
+    --panel-soft:  #134f41;
+    --line:        rgba(255,255,255,0.10);
+    --line-2:      rgba(255,255,255,0.18);
+
+    --ink:         #f5f3ee;     /* warm off-white */
+    --ink-dim:     #d3e2dc;
+    --ink-mute:    #9fc4b8;
+    --ink-faint:   #6a8e83;
+
+    /* Soft AI shimmer gradient (blue → violet → pink) */
+    --shimmer-a:   #7fb6ff;
+    --shimmer-b:   #b59bff;
+    --shimmer-c:   #f0a8d0;
+    --shimmer:     linear-gradient(135deg, var(--shimmer-a) 0%, var(--shimmer-b) 50%, var(--shimmer-c) 100%);
+
+    --font:        'Inter', 'Helvetica Neue', system-ui, sans-serif;
+    --mono:        'JetBrains Mono', ui-monospace, monospace;
+  }
+
+  html, body { margin: 0; background: var(--bg-deep); color: var(--ink); font-family: var(--font); -webkit-font-smoothing: antialiased; }
+
+  deck-stage > section {
+    width: 1920px; height: 1080px;
+    background: var(--bg);
+    color: var(--ink);
+    position: relative; overflow: hidden; box-sizing: border-box;
+    padding: 80px 120px;
+  }
+
+  /* ---- Persistent nav strip across slides ---- */
+  .nav {
+    position: absolute;
+    top: 40px; left: 120px; right: 120px;
+    display: flex; align-items: center;
+    height: 56px;
+    z-index: 4;
+    padding: 0 24px;
+    border-radius: 999px;
+    background: linear-gradient(135deg, rgba(255,255,255,0.08) 0%, rgba(255,255,255,0.03) 100%);
+    backdrop-filter: blur(18px) saturate(160%);
+    -webkit-backdrop-filter: blur(18px) saturate(160%);
+    border: 1px solid rgba(255,255,255,0.12);
+    box-shadow: 0 1px 0 rgba(255,255,255,0.14) inset;
+  }
+  .nav .brand {
+    display: flex; align-items: center; gap: 14px;
+    font-weight: 700; font-size: 22px; letter-spacing: -0.01em;
+  }
+  .nav .brand .glyph {
+    width: 36px; height: 36px;
+    border-radius: 10px;
+    background: var(--shimmer);
+    display: flex; align-items: center; justify-content: center;
+    color: #1a2a3a; font-weight: 800; font-size: 18px;
+    font-family: var(--mono);
+  }
+  .nav .links {
+    display: flex; gap: 36px; margin-left: 64px;
+    font-size: 15px; color: var(--ink-dim);
+  }
+  .nav .links span:nth-child(2) { color: var(--ink); font-weight: 500; }
+  .nav .cta {
+    margin-left: auto;
+    display: flex; align-items: center; gap: 12px;
+    font-size: 14px;
+    font-family: var(--mono);
+    color: var(--ink-mute);
+    letter-spacing: 0.04em;
+  }
+  .nav .cta .pill {
+    padding: 8px 18px;
+    border-radius: 999px;
+    background: rgba(255,255,255,0.95);
+    backdrop-filter: blur(8px);
+    color: var(--bg);
+    font-family: var(--font);
+    font-weight: 600;
+    font-size: 14px;
+    letter-spacing: 0;
+  }
+
+  /* slide counter / footer */
+  .footer {
+    position: absolute; bottom: 36px; left: 120px; right: 120px;
+    display: flex; justify-content: space-between; align-items: center;
+    font-family: var(--mono); font-size: 13px; color: var(--ink-faint);
+    letter-spacing: 0.08em; text-transform: uppercase;
+  }
+
+  /* ---- HERO (slide 1) ---- */
+  .hero {
+    position: absolute; inset: 0;
+    padding: 220px 120px 120px;
+    background:
+      radial-gradient(circle at 85% 25%, rgba(181, 155, 255, 0.18), transparent 45%),
+      radial-gradient(circle at 15% 85%, rgba(127, 182, 255, 0.12), transparent 50%),
+      var(--bg);
+  }
+  .hero h1 {
+    font-size: 144px; font-weight: 700;
+    letter-spacing: -0.04em; line-height: 0.95;
+    margin: 0 0 40px; color: var(--ink);
+    text-wrap: balance; max-width: 1100px;
+  }
+  .hero h1 .shimmer {
+    background: var(--shimmer);
+    -webkit-background-clip: text; background-clip: text;
+    color: transparent;
+  }
+  .hero .lede {
+    font-size: 28px; line-height: 1.4; color: var(--ink-dim);
+    max-width: 980px; font-weight: 400; margin-bottom: 56px;
+  }
+  .hero .actions { display: flex; gap: 16px; align-items: center; }
+  .hero .btn-primary {
+    background: var(--ink); color: var(--bg);
+    padding: 18px 34px; border-radius: 999px;
+    font-weight: 600; font-size: 18px;
+  }
+  .hero .btn-secondary {
+    color: var(--ink); padding: 18px 8px;
+    font-size: 18px; font-weight: 500;
+    display: flex; align-items: center; gap: 10px;
+  }
+  .hero .btn-secondary::after {
+    content: '→'; font-weight: 400;
+  }
+  .hero .availability {
+    margin-top: 32px;
+    font-size: 14px; color: var(--ink-mute);
+    font-family: var(--mono); letter-spacing: 0.04em;
+  }
+
+  /* floating chat-search-bar product card on hero — liquid glass */
+  .hero-card {
+    position: absolute;
+    right: 120px; top: 280px;
+    width: 540px;
+    color: var(--ink);
+    padding: 22px 24px;
+    border-radius: 22px;
+    display: flex; align-items: center; gap: 16px;
+    transform: rotate(-2deg);
+    background: linear-gradient(135deg, rgba(255,255,255,0.18) 0%, rgba(255,255,255,0.07) 100%);
+    backdrop-filter: blur(24px) saturate(170%);
+    -webkit-backdrop-filter: blur(24px) saturate(170%);
+    border: 1px solid rgba(255,255,255,0.22);
+    box-shadow:
+      0 1px 0 rgba(255,255,255,0.25) inset,
+      0 -1px 0 rgba(0,0,0,0.18) inset,
+      0 30px 80px rgba(0,0,0,0.4);
+  }
+  .hero-card::before {
+    content: ''; position: absolute; inset: 0; border-radius: inherit;
+    background: radial-gradient(ellipse 80% 50% at 30% 0%, rgba(255,255,255,0.22), transparent 70%);
+    pointer-events: none;
+  }
+  .hero-card .ai-orb {
+    width: 44px; height: 44px;
+    border-radius: 50%;
+    background: var(--shimmer);
+    flex-shrink: 0;
+    box-shadow: 0 0 30px rgba(181,155,255,0.5);
+  }
+  .hero-card .ph {
+    flex: 1;
+    color: var(--ink-dim);
+    font-size: 17px;
+  }
+  .hero-card .send-arrow {
+    width: 36px; height: 36px; border-radius: 50%;
+    background: rgba(255,255,255,0.18);
+    border: 1px solid rgba(255,255,255,0.25);
+    color: white;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 16px;
+  }
+  .hero-card-2 {
+    position: absolute;
+    right: 200px; top: 460px;
+    width: 480px;
+    color: var(--ink);
+    padding: 18px 22px;
+    border-radius: 18px;
+    border-top-left-radius: 4px;
+    transform: rotate(1.5deg);
+    background: linear-gradient(135deg, rgba(255,255,255,0.12) 0%, rgba(255,255,255,0.04) 100%);
+    backdrop-filter: blur(20px) saturate(160%);
+    -webkit-backdrop-filter: blur(20px) saturate(160%);
+    border: 1px solid rgba(255,255,255,0.18);
+    box-shadow:
+      0 1px 0 rgba(255,255,255,0.2) inset,
+      0 20px 50px rgba(0,0,0,0.35);
+  }
+  .hero-card-2 .who {
+    font-size: 13px; color: var(--shimmer-a); font-family: var(--mono); margin-bottom: 4px;
+  }
+  .hero-card-2 .msg { font-size: 17px; line-height: 1.4; }
+
+  /* ============ Generic slide layout helpers ============ */
+
+  .slide-pad {
+    position: absolute;
+    top: 140px; bottom: 100px; left: 120px; right: 120px;
+  }
+
+  .eyebrow {
+    display: inline-flex; align-items: center; gap: 12px;
+    font-family: var(--mono); font-size: 14px;
+    letter-spacing: 0.16em; text-transform: uppercase;
+    color: var(--ink-mute);
+    padding: 10px 18px;
+    border: 1px solid var(--line-2);
+    border-radius: 999px;
+    margin-bottom: 32px;
+  }
+  .eyebrow .dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: var(--shimmer);
+  }
+
+  .h-section {
+    font-size: 88px;
+    font-weight: 700;
+    letter-spacing: -0.03em;
+    line-height: 1.0;
+    margin: 0 0 28px;
+    color: var(--ink);
+    text-wrap: balance;
+    max-width: 1500px;
+  }
+  .h-section .shimmer {
+    background: var(--shimmer);
+    -webkit-background-clip: text; background-clip: text;
+    color: transparent;
+  }
+
+  .lede-md {
+    font-size: 24px; line-height: 1.45; color: var(--ink-dim);
+    max-width: 1100px; font-weight: 400;
+  }
+
+  /* ---- Feature card grid (slides 3, 7) ---- */
+  .feature-grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 24px;
+    margin-top: 56px;
+  }
+  .feature-card {
+    background: var(--panel);
+    border-radius: 28px;
+    padding: 32px 32px 28px;
+    display: flex; flex-direction: column;
+    min-height: 480px;
+    position: relative;
+    overflow: hidden;
+  }
+  .feature-card .visual {
+    height: 240px;
+    background: var(--panel-2);
+    border-radius: 18px;
+    margin-bottom: 28px;
+    position: relative;
+    overflow: hidden;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .feature-card .visual.shimmer-bg {
+    background:
+      radial-gradient(circle at 30% 40%, rgba(127, 182, 255, 0.35), transparent 55%),
+      radial-gradient(circle at 70% 60%, rgba(240, 168, 208, 0.28), transparent 55%),
+      var(--panel-2);
+  }
+  .feature-card .visual .placeholder-tag {
+    font-family: var(--mono); font-size: 13px; letter-spacing: 0.08em;
+    color: var(--ink-mute); text-transform: uppercase;
+    padding: 8px 14px; border: 1px dashed var(--line-2); border-radius: 8px;
+    background: rgba(0,0,0,0.18);
+  }
+  .feature-card h3 {
+    font-size: 26px; font-weight: 600; letter-spacing: -0.015em;
+    margin: 0 0 12px; color: var(--ink);
+  }
+  .feature-card p {
+    font-size: 17px; line-height: 1.5; color: var(--ink-dim);
+    margin: 0; flex: 1;
+  }
+  .feature-card .more {
+    margin-top: 20px;
+    font-size: 15px; color: var(--ink); font-weight: 500;
+    display: inline-flex; align-items: center; gap: 8px;
+  }
+  .feature-card .more::after { content: '→'; }
+
+  /* visual content: orb */
+  .visual .orb {
+    width: 110px; height: 110px;
+    border-radius: 50%;
+    background: var(--shimmer);
+    box-shadow: 0 0 80px rgba(181, 155, 255, 0.5);
+  }
+  /* visual content: bubble pair */
+  .visual .vbubbles {
+    display: flex; flex-direction: column; gap: 10px;
+    width: 80%;
+  }
+  .visual .vbubble {
+    background: var(--bg-deep);
+    color: var(--ink-dim);
+    padding: 10px 14px; border-radius: 14px;
+    font-size: 14px; font-family: var(--mono);
+    align-self: flex-start;
+  }
+  .visual .vbubble.out {
+    background: var(--ink); color: var(--bg);
+    align-self: flex-end;
+    border-bottom-right-radius: 4px;
+  }
+  /* visual content: code-ish lines */
+  .visual .vlines {
+    display: flex; flex-direction: column; gap: 10px;
+    width: 80%; font-family: var(--mono);
+  }
+  .visual .vlines .vline {
+    height: 12px; border-radius: 6px;
+    background: rgba(255,255,255,0.10);
+  }
+  .visual .vlines .vline.short { width: 60%; }
+  .visual .vlines .vline.med { width: 80%; }
+  .visual .vlines .vline.shimmer-bar {
+    background: var(--shimmer); width: 45%;
+  }
+
+  /* ---- Two-up slide (slide 2, 4, 6) ---- */
+  .two-up {
+    display: grid;
+    grid-template-columns: 1.05fr 1fr;
+    gap: 80px;
+    align-items: center;
+    height: 100%;
+  }
+  .two-up.image-left { grid-template-columns: 1fr 1.05fr; }
+  .image-card {
+    background: var(--panel);
+    border-radius: 28px;
+    padding: 40px;
+    height: 640px;
+    position: relative;
+    overflow: hidden;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .image-card.shimmer-bg {
+    background:
+      radial-gradient(circle at 30% 30%, rgba(127, 182, 255, 0.32), transparent 55%),
+      radial-gradient(circle at 75% 75%, rgba(240, 168, 208, 0.25), transparent 55%),
+      var(--panel);
+  }
+
+  /* Architecture diagram visual */
+  .arch-diagram {
+    width: 100%;
+    display: flex; flex-direction: column; gap: 14px;
+    font-family: var(--mono);
+  }
+  .arch-row {
+    display: flex; gap: 14px; align-items: stretch;
+  }
+  .arch-box {
+    flex: 1;
+    background: var(--bg-deep);
+    border: 1px solid var(--line-2);
+    border-radius: 14px;
+    padding: 18px 20px;
+    display: flex; flex-direction: column; gap: 6px;
+  }
+  .arch-box .lbl { font-size: 11px; letter-spacing: 0.1em; color: var(--ink-faint); text-transform: uppercase; }
+  .arch-box .name { font-size: 22px; font-weight: 600; color: var(--ink); font-family: var(--font); letter-spacing: -0.01em; }
+  .arch-box .desc { font-size: 12px; color: var(--ink-mute); line-height: 1.5; }
+  .arch-box.accent { background: linear-gradient(135deg, var(--shimmer-a), var(--shimmer-b)); border-color: transparent; color: #1a2a3a; }
+  .arch-box.accent .lbl { color: rgba(26,42,58,0.65); }
+  .arch-box.accent .name { color: #1a2a3a; }
+  .arch-box.accent .desc { color: rgba(26,42,58,0.8); }
+  .arch-down { text-align: center; color: var(--ink-faint); font-size: 18px; }
+
+  /* ---- Big-stats row (slide 8) ---- */
+  .stat-row {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 24px;
+    margin-top: 56px;
+  }
+  .stat-card {
+    background: var(--panel);
+    border-radius: 28px;
+    padding: 40px 36px;
+  }
+  .stat-card .num {
+    font-size: 124px; font-weight: 700;
+    letter-spacing: -0.04em; line-height: 0.9;
+    color: var(--ink);
+    margin-bottom: 16px;
+  }
+  .stat-card .num .shimmer {
+    background: var(--shimmer);
+    -webkit-background-clip: text; background-clip: text;
+    color: transparent;
+  }
+  .stat-card .lbl {
+    font-size: 16px; color: var(--ink-mute); font-family: var(--mono);
+    letter-spacing: 0.04em; text-transform: uppercase;
+  }
+  .stat-card .desc {
+    margin-top: 12px;
+    font-size: 16px; color: var(--ink-dim); line-height: 1.5;
+  }
+
+  /* ---- Topic taxonomy slide (slide 5) ---- */
+  .topic-card {
+    background: var(--ink);
+    color: #1a2a2a;
+    border-radius: 22px;
+    padding: 28px 30px;
+    box-shadow: 0 30px 80px rgba(0,0,0,0.35);
+    width: 100%;
+  }
+  .topic-card .topic-search {
+    display: flex; align-items: center; gap: 14px;
+    padding: 14px 18px;
+    background: #f0eee8;
+    border-radius: 14px;
+    margin-bottom: 22px;
+  }
+  .topic-card .topic-search .ai-orb {
+    width: 28px; height: 28px; border-radius: 50%;
+    background: var(--shimmer); flex-shrink: 0;
+  }
+  .topic-card .topic-search .ph {
+    color: #6b7d77; font-size: 15px; flex: 1;
+  }
+  .topic-card .topic-list { display: flex; flex-direction: column; gap: 12px; }
+  .topic-card .topic-row {
+    display: flex; align-items: center; gap: 16px;
+    padding: 14px 16px;
+    background: #f6f4ee;
+    border-radius: 12px;
+  }
+  .topic-card .topic-row .topic-mono {
+    font-family: var(--mono); font-size: 15px; color: #14322a;
+    font-weight: 500;
+  }
+  .topic-card .topic-row .topic-rate {
+    margin-left: auto;
+    font-family: var(--mono); font-size: 12px; color: #6b7d77;
+    background: white; padding: 4px 10px; border-radius: 999px;
+  }
+  .topic-card .topic-row .pin {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: #1a8b6e;
+  }
+
+  /* ---- FAQ list (slide 9) ---- */
+  .faq-list {
+    margin-top: 48px;
+    display: flex; flex-direction: column; gap: 4px;
+    max-width: 1500px;
+  }
+  .faq-row {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 28px 8px;
+    border-top: 1px solid var(--line-2);
+    font-size: 26px; color: var(--ink);
+    font-weight: 500;
+    letter-spacing: -0.01em;
+  }
+  .faq-row:last-child { border-bottom: 1px solid var(--line-2); }
+  .faq-row .a {
+    font-size: 18px; color: var(--ink-mute); font-weight: 400;
+    max-width: 800px; text-align: right;
+    margin-left: 32px;
+    font-family: var(--font);
+  }
+  .faq-row .plus {
+    margin-left: 24px;
+    width: 36px; height: 36px; border-radius: 50%;
+    border: 1px solid var(--line-2);
+    display: flex; align-items: center; justify-content: center;
+    font-size: 20px; color: var(--ink-mute); font-weight: 300;
+    flex-shrink: 0;
+  }
+
+  /* ---- Closing CTA (slide 10) ---- */
+  .closing-hero {
+    position: absolute; inset: 0;
+    padding: 200px 120px 120px;
+    background:
+      radial-gradient(circle at 70% 40%, rgba(181, 155, 255, 0.22), transparent 55%),
+      radial-gradient(circle at 20% 80%, rgba(127, 182, 255, 0.14), transparent 55%),
+      var(--bg);
+    display: flex; flex-direction: column; justify-content: center;
+  }
+  .closing-hero h1 {
+    font-size: 192px; font-weight: 700;
+    letter-spacing: -0.045em; line-height: 0.95;
+    margin: 0 0 40px; max-width: 1600px;
+    text-wrap: balance;
+  }
+  .closing-hero h1 .shimmer {
+    background: var(--shimmer);
+    -webkit-background-clip: text; background-clip: text;
+    color: transparent;
+  }
+  .closing-hero .lede {
+    font-size: 26px; line-height: 1.4; color: var(--ink-dim);
+    max-width: 1100px; font-weight: 400; margin-bottom: 56px;
+  }
+
+  /* small helpers */
+  .mono { font-family: var(--mono); }
+  .center { display: flex; align-items: center; justify-content: center; }
+
+  /* ===== Liquid glass surface ===== */
+  /* Used sparingly: floating overlays & pill chrome only */
+  .glass {
+    background: linear-gradient(135deg, rgba(255,255,255,0.14) 0%, rgba(255,255,255,0.06) 100%);
+    backdrop-filter: blur(22px) saturate(160%);
+    -webkit-backdrop-filter: blur(22px) saturate(160%);
+    border: 1px solid rgba(255,255,255,0.18);
+    box-shadow:
+      0 1px 0 rgba(255,255,255,0.18) inset,
+      0 -1px 0 rgba(0,0,0,0.15) inset,
+      0 30px 80px rgba(0,0,0,0.35);
+    position: relative;
+  }
+  .glass::before {
+    content: '';
+    position: absolute; inset: 0;
+    border-radius: inherit;
+    background: radial-gradient(ellipse 80% 60% at 30% 0%, rgba(255,255,255,0.18), transparent 60%);
+    pointer-events: none;
+  }
+  .glass-light {
+    background: linear-gradient(135deg, rgba(255,255,255,0.7) 0%, rgba(255,255,255,0.55) 100%);
+    backdrop-filter: blur(22px) saturate(180%);
+    -webkit-backdrop-filter: blur(22px) saturate(180%);
+    border: 1px solid rgba(255,255,255,0.6);
+    box-shadow:
+      0 1px 0 rgba(255,255,255,0.9) inset,
+      0 30px 80px rgba(0,0,0,0.3);
+    position: relative;
+  }
+  .glass-pill {
+    background: rgba(255,255,255,0.10);
+    backdrop-filter: blur(14px) saturate(160%);
+    -webkit-backdrop-filter: blur(14px) saturate(160%);
+    border: 1px solid rgba(255,255,255,0.18);
+    box-shadow: 0 1px 0 rgba(255,255,255,0.16) inset;
+  }
+
+  /* ===== Technical diagram primitives ===== */
+  .diag-card {
+    background: var(--panel);
+    border-radius: 28px;
+    padding: 48px 56px;
+    width: 100%;
+    box-sizing: border-box;
+    position: relative;
+  }
+  .diag-card.dark { background: var(--bg-deep); border: 1px solid var(--line-2); }
+  .diag-caption {
+    font-family: var(--mono); font-size: 12px;
+    letter-spacing: 0.12em; text-transform: uppercase;
+    color: var(--ink-faint);
+    margin-bottom: 18px;
+  }
+  .diag-grid {
+    display: grid; gap: 16px;
+  }
+  .diag-node {
+    background: var(--bg-deep);
+    border: 1px solid var(--line-2);
+    border-radius: 14px;
+    padding: 18px 22px;
+    display: flex; flex-direction: column; gap: 4px;
+    font-family: var(--mono);
+    color: var(--ink);
+    min-width: 0;
+  }
+  .diag-node .nlbl {
+    font-size: 11px; letter-spacing: 0.1em; text-transform: uppercase;
+    color: var(--ink-faint);
+  }
+  .diag-node .nname {
+    font-size: 18px; font-weight: 600; letter-spacing: -0.01em; color: var(--ink);
+    font-family: var(--font);
+  }
+  .diag-node .nmeta { font-size: 12px; color: var(--ink-mute); line-height: 1.45; }
+  .diag-node.shimmer-fill {
+    background: linear-gradient(135deg, var(--shimmer-a), var(--shimmer-b));
+    border-color: transparent; color: #1a2a3a;
+  }
+  .diag-node.shimmer-fill .nlbl { color: rgba(26,42,58,0.65); }
+  .diag-node.shimmer-fill .nname { color: #1a2a3a; }
+  .diag-node.shimmer-fill .nmeta { color: rgba(26,42,58,0.78); }
+  .diag-node.dim { background: transparent; border-style: dashed; color: var(--ink-mute); }
+  .diag-node.dim .nname { color: var(--ink-mute); }
+
+  .diag-arrow-h {
+    align-self: center;
+    height: 2px; background: var(--ink-faint); position: relative;
+    min-width: 32px;
+  }
+  .diag-arrow-h::after {
+    content: ''; position: absolute; right: -1px; top: -5px;
+    border-left: 8px solid var(--ink-faint);
+    border-top: 5px solid transparent; border-bottom: 5px solid transparent;
+  }
+  .diag-arrow-h.shim { background: var(--shimmer); }
+  .diag-arrow-h.shim::after { border-left-color: var(--shimmer-b); }
+  .diag-arrow-v {
+    justify-self: center;
+    width: 2px; background: var(--ink-faint); position: relative;
+    min-height: 28px;
+  }
+  .diag-arrow-v::after {
+    content: ''; position: absolute; bottom: -1px; left: -5px;
+    border-top: 8px solid var(--ink-faint);
+    border-left: 5px solid transparent; border-right: 5px solid transparent;
+  }
+
+  /* Sequence diagram */
+  .seq {
+    display: grid;
+    grid-template-columns: 60px 1fr 1fr 1fr 1fr;
+    gap: 0;
+    font-family: var(--mono);
+    font-size: 14px;
+    color: var(--ink);
+  }
+  .seq .seq-actor {
+    text-align: center;
+    padding: 12px 8px;
+    background: var(--bg-deep);
+    border-radius: 12px;
+    margin: 0 16px;
+    color: var(--ink);
+    font-weight: 600;
+    font-size: 14px;
+    font-family: var(--font);
+  }
+  .seq .seq-actor.accent {
+    background: linear-gradient(135deg, var(--shimmer-a), var(--shimmer-b));
+    color: #1a2a3a;
+  }
+  .seq .seq-row {
+    display: contents;
+  }
+  .seq-track {
+    border-left: 1px dashed var(--line-2);
+    margin: 0 50%;
+    height: 100%;
+  }
+  .seq-msg {
+    grid-column: 1 / -1;
+    display: grid;
+    grid-template-columns: 60px 1fr 1fr 1fr 1fr;
+    align-items: center;
+    padding: 10px 0;
+    position: relative;
+  }
+  .seq-msg .seq-label {
+    padding: 8px 14px;
+    background: var(--bg-deep);
+    border-radius: 10px;
+    font-size: 13px;
+    color: var(--ink-dim);
+    text-align: center;
+    margin: 0 16px;
+    border: 1px solid var(--line-2);
+  }
+  .seq-msg .seq-label.shim {
+    background: linear-gradient(135deg, var(--shimmer-a), var(--shimmer-b));
+    color: #1a2a3a;
+    border-color: transparent;
+    font-weight: 500;
+  }
+  .seq-msg .seq-time {
+    text-align: right;
+    padding-right: 16px;
+    color: var(--ink-faint);
+    font-size: 12px;
+  }
+  .seq-msg .seq-empty { /* spacer */ }
+
+  /* State machine */
+  .state-machine {
+    display: grid;
+    grid-template-columns: 1fr 80px 1fr 80px 1fr;
+    align-items: center;
+    gap: 0 8px;
+  }
+  .state-node {
+    background: var(--bg-deep);
+    border: 2px solid var(--line-2);
+    border-radius: 18px;
+    padding: 22px 18px;
+    text-align: center;
+    font-family: var(--mono);
+    color: var(--ink);
+  }
+  .state-node.active {
+    border-color: var(--shimmer-b);
+    box-shadow: 0 0 0 6px rgba(181,155,255,0.12);
+  }
+  .state-node .sn-name { font-size: 22px; font-weight: 600; font-family: var(--font); letter-spacing: -0.01em; }
+  .state-node .sn-meta { font-size: 12px; color: var(--ink-mute); margin-top: 6px; letter-spacing: 0.05em; }
+  .state-edge {
+    display: flex; flex-direction: column; align-items: center; gap: 4px;
+    color: var(--ink-mute);
+    font-family: var(--mono); font-size: 11px;
+    letter-spacing: 0.06em; text-transform: uppercase;
+  }
+  .state-edge .arr {
+    width: 100%; height: 2px; background: var(--ink-faint); position: relative;
+  }
+  .state-edge .arr::after {
+    content: ''; position: absolute; right: -1px; top: -5px;
+    border-left: 8px solid var(--ink-faint);
+    border-top: 5px solid transparent; border-bottom: 5px solid transparent;
+  }
+  .state-edge.shim .arr { background: var(--shimmer); }
+  .state-edge.shim .arr::after { border-left-color: var(--shimmer-b); }
+
+  /* Deployment topology */
+  .topo {
+    display: grid;
+    grid-template-rows: auto auto auto auto auto;
+    gap: 16px;
+  }
+  .topo .topo-band {
+    border: 1px dashed var(--line-2);
+    border-radius: 18px;
+    padding: 18px;
+    position: relative;
+  }
+  .topo .topo-band-label {
+    position: absolute; top: -10px; left: 18px;
+    background: var(--panel); padding: 0 10px;
+    font-family: var(--mono); font-size: 11px;
+    color: var(--ink-mute); letter-spacing: 0.12em; text-transform: uppercase;
+  }
+  .topo-row { display: grid; gap: 12px; }
+  .topo-row.cols-2 { grid-template-columns: 1fr 1fr; }
+  .topo-row.cols-3 { grid-template-columns: 1fr 1fr 1fr; }
+  .topo-row.cols-1 { grid-template-columns: 1fr; }
+  .topo-arrow-down {
+    text-align: center; color: var(--ink-faint); font-size: 22px; line-height: 1;
+  }
+
+  /* Data flow lanes */
+  .lanes {
+    display: grid;
+    grid-template-columns: 220px repeat(5, 1fr);
+    gap: 0;
+    align-items: center;
+  }
+  .lane-label {
+    font-family: var(--mono); font-size: 14px;
+    color: var(--ink); font-weight: 500;
+    padding: 14px 18px;
+    border-right: 1px solid var(--line-2);
+  }
+  .lane-cell {
+    padding: 14px 8px;
+    text-align: center;
+    color: var(--ink-mute);
+    font-family: var(--mono); font-size: 12px;
+    border-bottom: 1px solid var(--line);
+  }
+  .lane-row { display: contents; }
+  .lane-cell.active {
+    color: var(--ink);
+  }
+  .lane-pill {
+    display: inline-block;
+    padding: 6px 12px; border-radius: 999px;
+    background: linear-gradient(135deg, var(--shimmer-a), var(--shimmer-b));
+    color: #1a2a3a; font-weight: 500;
+  }
+  .lane-pill.dim {
+    background: var(--bg-deep);
+    color: var(--ink-mute);
+    border: 1px solid var(--line-2);
+  }
+
+
+/* ── Floating deck controls (Present + Export PDF) ── */
+.deck-controls { position: fixed; top: 16px; right: 16px; display: flex; gap: 8px; z-index: 9999; }
+.deck-controls button {
+  display: inline-flex; align-items: center; gap: 7px;
+  padding: 9px 16px; border-radius: 999px;
+  border: 1px solid rgba(255,255,255,0.16);
+  background: rgba(10,61,51,0.88); color: #fff;
+  font-family: 'Inter', system-ui, sans-serif;
+  font-size: 12.5px; font-weight: 500; letter-spacing: 0.2px;
+  cursor: pointer; backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
+  transition: background 0.15s, transform 0.15s, box-shadow 0.15s;
+  box-shadow: 0 4px 12px rgba(10,61,51,0.20);
+}
+.deck-controls button:hover { background: rgba(10,61,51,1); transform: translateY(-1px); box-shadow: 0 6px 18px rgba(10,61,51,0.30); }
+.deck-controls button:active { transform: translateY(0); }
+.deck-controls button svg { width: 13px; height: 13px; }
+@media print { .deck-controls { display: none !important; } }
+:fullscreen .deck-controls, :-webkit-full-screen .deck-controls { opacity: 0.4; transition: opacity 0.2s; }
+:fullscreen .deck-controls:hover, :-webkit-full-screen .deck-controls:hover { opacity: 1; }
+</style>
+</head>
+<body>
+
+<deck-stage>
+
+  <!-- ====================================================== -->
+  <!-- SLIDE 1 — HERO                                           -->
+  <!-- ====================================================== -->
+  <section data-screen-label="01 Hero">
+    <div class="nav">
+      <div class="brand"><div class="glyph">M</div>Market Data Broker</div>
+      <div class="links"><span>Overview</span><span>Architecture</span><span>Demo</span><span>Docs</span></div>
+      <div class="cta"><span style="font-family: var(--mono); font-size: 12px; color: var(--ink-faint); letter-spacing: 0.08em; text-transform: uppercase;">silver 8 · engineering manager interview</span></div>
+    </div>
+
+    <div class="hero">
+      <h1>Do more with <span class="shimmer">real-time market&nbsp;data.</span></h1>
+      <p class="lede" style="max-width: 820px;">A demand-driven Coinbase pub/sub hub. One upstream WSS connection, many heterogeneous consumers — plain WebSocket, MCP for LLM agents, ops endpoints. Ref-counted; zero leaked upstream subscriptions across 239 tests.</p>
+      <div class="availability">Python asyncio · FastMCP · websockets · structlog · pytest. Single-container Docker deploy. Live against ws-feed.exchange.coinbase.com.</div>
+    </div>
+
+    <!-- floating product cards -->
+    <div class="hero-card" style="right: 100px; top: 620px;">
+      <div class="ai-orb"></div>
+      <div class="ph">Subscribe coinbase.ticker.BTC-USD</div>
+      <div class="send-arrow">↑</div>
+    </div>
+    <div class="hero-card-2" style="right: 180px; top: 800px;">
+      <div class="who">@broker</div>
+      <div class="msg">Streaming live · 1 upstream sub · 3 consumers · 0 leaks · ~5 Hz BTC ticker</div>
+    </div>
+
+    <div class="footer">
+      <span>github.com/weyseing/market_data_broker</span>
+      <span>01 / 13</span>
+    </div>
+  </section>
+
+  <!-- ====================================================== -->
+  <!-- SLIDE 2 — INTRO / TWO-UP                                 -->
+  <!-- ====================================================== -->
+  <section data-screen-label="02 Intro">
+    <div class="nav">
+      <div class="brand"><div class="glyph">M</div>Market Data Broker</div>
+      <div class="links"><span>Overview</span><span>Architecture</span><span>Demo</span><span>Docs</span></div>
+      <div class="cta"></div>
+    </div>
+
+    <div class="slide-pad">
+      <div class="two-up">
+        <div>
+          <div class="eyebrow"><span class="dot"></span>The pitch</div>
+          <h2 class="h-section">A real-time data <span class="shimmer">hub</span> for crypto markets.</h2>
+          <p class="lede-md">One Coinbase WSS connection upstream, many heterogeneous consumers downstream — plain WebSocket clients, MCP-speaking LLM agents, internal ops endpoints. Demand-driven via ref-counting in the registry: the broker only holds a Coinbase subscription while at least one consumer wants it. The moment the last consumer leaves, we send UNSUBSCRIBE upstream within milliseconds. Single-process Python asyncio. In-memory state only — restart-safe by design.</p>
+        </div>
+        <div class="image-card shimmer-bg">
+          <div style="display:flex; flex-direction:column; gap: 18px; width: 78%;">
+            <div style="background: var(--ink); color: #1a2a2a; padding: 20px 24px; border-radius: 20px; display: flex; align-items: center; gap: 14px;">
+              <div style="width: 36px; height: 36px; border-radius: 50%; background: var(--shimmer);"></div>
+              <div style="flex: 1; font-size: 16px; color: #6b7d77;">Subscribe coinbase.ticker.BTC-USD</div>
+              <div style="width: 30px; height: 30px; border-radius: 50%; background: #0a3d33; color: white; display: flex; align-items: center; justify-content: center; font-size: 14px;">↑</div>
+            </div>
+            <div style="background: var(--bg-deep); padding: 16px 20px; border-radius: 18px; border-top-left-radius: 4px; align-self: flex-start; max-width: 80%;">
+              <div style="font-size: 12px; color: var(--shimmer-a); font-family: var(--mono); margin-bottom: 4px;">@broker</div>
+              <div style="font-size: 15px; color: var(--ink-dim); line-height: 1.4;">Streaming live · 1 upstream sub · BTC-USD ticker · ~5 Hz</div>
+            </div>
+            <div style="background: var(--ink); color: #1a2a2a; padding: 14px 18px; border-radius: 16px; align-self: flex-end; font-family: var(--mono); font-size: 14px;">
+              { price: 67421.50, ts: 10:31:04 }
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="footer"><span>02 · the pitch</span><span>02 / 13</span></div>
+  </section>
+
+  <!-- ====================================================== -->
+  <!-- SLIDE 3 — FEATURE GRID                                   -->
+  <!-- ====================================================== -->
+  <section data-screen-label="03 Features">
+    <div class="nav">
+      <div class="brand"><div class="glyph">M</div>Market Data Broker</div>
+      <div class="links"><span>Overview</span><span>Architecture</span><span>Demo</span><span>Docs</span></div>
+      <div class="cta"></div>
+    </div>
+
+    <div class="slide-pad">
+      <div class="eyebrow"><span class="dot"></span>What it does</div>
+      <h2 class="h-section" style="font-size: 72px;">The broker makes your market-data setup <span class="shimmer">simpler.</span></h2>
+
+      <div class="feature-grid">
+        <div class="feature-card">
+          <div class="visual shimmer-bg"><div class="orb"></div></div>
+          <h3>Fan out</h3>
+          <p>One Coinbase WebSocket in, N heterogeneous consumers out — plain WS, MCP tools, ops endpoints. Bounded <span class="mono">asyncio.Queue</span> per consumer (default 1000). On overflow we drop the oldest message and increment a per-consumer counter. Sustained drops > 100 close that consumer with WS close code 1013 — slow consumers cannot degrade peers.</p>
+          <span class="more">Learn more</span>
+        </div>
+        <div class="feature-card">
+          <div class="visual">
+            <div class="vbubbles">
+              <div class="vbubble">subscribe ticker.BTC-USD</div>
+              <div class="vbubble out">{ price: 67421.50 }</div>
+              <div class="vbubble">unsubscribe</div>
+            </div>
+          </div>
+          <h3>Demand-driven by design</h3>
+          <p>We only ask Coinbase for a topic when at least one consumer wants it. The registry fires <span class="mono">on_first_subscriber</span> at the 0→1 edge and <span class="mono">on_last_unsubscriber</span> at the 1→0 edge — ingest hooks both into upstream SUBSCRIBE / UNSUBSCRIBE frames. Pinned by <span class="mono">test_disconnect_releases_topics_no_leak</span>.</p>
+          <span class="more">Learn more</span>
+        </div>
+        <div class="feature-card">
+          <div class="visual">
+            <div class="vlines">
+              <div class="vline med"></div>
+              <div class="vline shimmer-bar"></div>
+              <div class="vline short"></div>
+              <div class="vline med"></div>
+              <div class="vline short"></div>
+            </div>
+          </div>
+          <h3>Two surfaces, one core</h3>
+          <p>Plain WebSocket for general clients on <span class="mono">:8765</span>. HTTP MCP for LLM agents on <span class="mono">:8000</span> — five tools: <span class="mono">list_topics</span>, <span class="mono">describe_topic</span>, <span class="mono">get_snapshot</span>, <span class="mono">stream_topic</span>, <span class="mono">get_hub_status</span>. Both surfaces are first-class consumers — same topic taxonomy, same registry, same refcount semantics.</p>
+          <span class="more">Learn more</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="footer"><span>03 · features</span><span>03 / 13</span></div>
+  </section>
+
+  <!-- ====================================================== -->
+  <!-- SLIDE 4 — ARCHITECTURE (image-right)                     -->
+  <!-- ====================================================== -->
+  <section data-screen-label="04 Architecture">
+    <div class="nav">
+      <div class="brand"><div class="glyph">M</div>Market Data Broker</div>
+      <div class="links"><span>Overview</span><span>Architecture</span><span>Demo</span><span>Docs</span></div>
+      <div class="cta"></div>
+    </div>
+
+    <div class="slide-pad">
+      <div class="two-up image-left">
+        <div class="image-card">
+          <div class="arch-diagram">
+            <div class="arch-row">
+              <div class="arch-box">
+                <span class="lbl">upstream</span>
+                <span class="name">Coinbase WSS</span>
+                <span class="desc">One connection · exp backoff 1→30s · stale-feed watchdog forces reconnect on missed frames</span>
+              </div>
+            </div>
+            <div class="arch-down">↓</div>
+            <div class="arch-row">
+              <div class="arch-box">
+                <span class="lbl">layer 1</span>
+                <span class="name">ingest</span>
+                <span class="desc">Owns upstream WS · normalises frames to Message envelope · demand reconcile loop</span>
+              </div>
+              <div class="arch-box">
+                <span class="lbl">layer 2</span>
+                <span class="name">bus</span>
+                <span class="desc">Asyncio pub/sub · bounded queue per consumer · drop-oldest at 1000-deep</span>
+              </div>
+            </div>
+            <div class="arch-down">↓</div>
+            <div class="arch-row">
+              <div class="arch-box accent">
+                <span class="lbl">layer 3 — the hinge</span>
+                <span class="name">registry</span>
+                <span class="desc">Counts holders as <span class="mono">dict[topic, set[consumer_id]]</span>. Fires <span class="mono">on_first_subscriber</span> at 0→1, <span class="mono">on_last_unsubscriber</span> at 1→0. Both async; ingest hooks both.</span>
+              </div>
+            </div>
+            <div class="arch-down">↓</div>
+            <div class="arch-row">
+              <div class="arch-box">
+                <span class="lbl">surface</span>
+                <span class="name">server.ws</span>
+                <span class="desc">:8765</span>
+              </div>
+              <div class="arch-box">
+                <span class="lbl">surface</span>
+                <span class="name">server.mcp</span>
+                <span class="desc">:8000</span>
+              </div>
+              <div class="arch-box">
+                <span class="lbl">surface</span>
+                <span class="name">/status</span>
+                <span class="desc">:8080</span>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div>
+          <div class="eyebrow"><span class="dot"></span>How it works</div>
+          <h2 class="h-section" style="font-size: 76px;">Four layers, <span class="shimmer">one hinge.</span></h2>
+          <p class="lede-md">Each layer owns one concern. <span class="mono" style="color:var(--shimmer-a)">ingest</span> talks to Coinbase via the <span class="mono">websockets</span> library — exp backoff, stale-feed watchdog, demand reconcile. <span class="mono" style="color:var(--shimmer-a)">bus</span> is asyncio pub/sub with bounded queues. <span class="mono" style="color:var(--shimmer-a)">registry</span> ref-counts holders and fires sub/unsub callbacks. Surfaces speak WS or HTTP MCP via FastMCP. Adding a venue is one new ingest module; adding a protocol is one new server module. The other three layers don't change.</p>
+        </div>
+      </div>
+    </div>
+
+    <div class="footer"><span>04 · architecture</span><span>04 / 13</span></div>
+  </section>
+
+  <!-- ============================ -->
+  <!-- INJECTED · 05 Topology       -->
+  <!-- ============================ -->
+  <section data-screen-label="04e Topology">
+    <div class="nav">
+      <div class="brand"><div class="glyph">M</div>Market Data Broker</div>
+      <div class="links"><span>Overview</span><span>Architecture</span><span>Demo</span><span>Docs</span></div>
+      <div class="cta"></div>
+    </div>
+
+    <div class="slide-pad">
+      <div class="two-up">
+        <div>
+          <div class="eyebrow"><span class="dot"></span>Deployment topology</div>
+          <h2 class="h-section" style="font-size: 64px;">Single container, <span class="shimmer">three ports.</span></h2>
+          <p class="lede-md">One Docker image, one Python process, three ports. Plain WebSocket clients on <span class="mono">:8765</span>. MCP-speaking LLM agents on <span class="mono">:8000</span>. Ops + health probes on <span class="mono">:8080</span>. No database; on restart, clients reconnect and upstream subs reconcile from new demand.</p>
+        </div>
+
+        <div class="diag-card dark">
+          <div class="diag-caption">Single Docker container · three ports · stateless</div>
+
+          <div class="topo">
+            <div class="topo-band">
+              <div class="topo-band-label" style="background: var(--bg-deep);">UPSTREAM</div>
+              <div class="topo-row cols-1">
+                <div class="diag-node"><span class="nlbl">exchange</span><span class="nname">Coinbase WSS</span><span class="nmeta">ws-feed.exchange.coinbase.com</span></div>
+              </div>
+            </div>
+            <div class="topo-arrow-down">↓</div>
+            <div class="topo-band" style="border-color: var(--shimmer-b);">
+              <div class="topo-band-label" style="background: var(--bg-deep); color: var(--shimmer-a);">BROKER · 1 container</div>
+              <div class="topo-row cols-3">
+                <div class="diag-node"><span class="nlbl">port</span><span class="nname">:8765</span><span class="nmeta">server.ws</span></div>
+                <div class="diag-node shimmer-fill"><span class="nlbl">port</span><span class="nname">:8000</span><span class="nmeta">server.mcp · http</span></div>
+                <div class="diag-node"><span class="nlbl">port</span><span class="nname">:8080</span><span class="nmeta">server.status</span></div>
+              </div>
+            </div>
+            <div class="topo-arrow-down">↓</div>
+            <div class="topo-band">
+              <div class="topo-band-label" style="background: var(--bg-deep);">DOWNSTREAM</div>
+              <div class="topo-row cols-3">
+                <div class="diag-node dim"><span class="nlbl">consumer</span><span class="nname">WS clients</span><span class="nmeta">internal services</span></div>
+                <div class="diag-node dim"><span class="nlbl">consumer</span><span class="nname">LLM agents</span><span class="nmeta">Claude Desktop, MCP Inspector</span></div>
+                <div class="diag-node dim"><span class="nlbl">consumer</span><span class="nname">Ops · health</span><span class="nmeta">Prometheus, k8s probes</span></div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="footer"><span>05 · topology</span><span>05 / 13</span></div>
+  </section>
+
+  <!-- ============================ -->
+  <!-- INJECTED · 06 Config + API   -->
+  <!-- ============================ -->
+  <section data-screen-label="04j Config">
+    <div class="nav">
+      <div class="brand"><div class="glyph">M</div>Market Data Broker</div>
+      <div class="links"><span>Overview</span><span>Architecture</span><span>Demo</span><span>Docs</span></div>
+      <div class="cta"></div>
+    </div>
+
+    <div class="slide-pad">
+      <div class="eyebrow"><span class="dot"></span>Configuration · API surface</div>
+      <h2 class="h-section" style="font-size: 60px;">One config file, <span class="shimmer">three surfaces.</span></h2>
+
+      <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 24px; margin-top: 36px;">
+        <!-- LEFT: code editor with YAML -->
+        <div style="background: #0a1f1a; border: 1px solid var(--line-2); border-radius: 18px; overflow: hidden;">
+          <div style="display: flex; padding: 0; background: #0e2620; border-bottom: 1px solid var(--line-2);">
+            <div style="padding: 12px 18px; background: #0a1f1a; color: var(--ink); font-family: var(--mono); font-size: 12px; border-right: 1px solid var(--line-2);">config.yaml</div>
+            <div style="padding: 12px 18px; color: var(--ink-faint); font-family: var(--mono); font-size: 12px;">.env</div>
+            <span style="margin-left: auto; padding: 12px 18px; font-family: var(--mono); font-size: 11px; color: var(--ink-faint);">defaults + env-var overrides</span>
+          </div>
+          <div style="padding: 22px 0; font-family: var(--mono); font-size: 14px; line-height: 1.75; display: grid; grid-template-columns: 36px 1fr;">
+            <div style="text-align: right; padding-right: 12px; color: var(--ink-faint); user-select: none;">
+              <div>1</div><div>2</div><div>3</div><div>4</div><div>5</div><div>6</div><div>7</div><div>8</div><div>9</div><div>10</div><div>11</div><div>12</div><div>13</div><div>14</div><div>15</div>
+            </div>
+            <div style="padding-right: 24px; color: var(--ink-dim);">
+              <div><span style="color: var(--shimmer-a);">coinbase</span>:</div>
+              <div>&nbsp;&nbsp;<span style="color: var(--shimmer-a);">ws_url</span>: <span style="color: #d8b878;">wss://ws-feed.exchange…</span></div>
+              <div>&nbsp;&nbsp;<span style="color: var(--shimmer-a);">heartbeat_timeout_seconds</span>: <span style="color: #d8b878;">15</span></div>
+              <div>&nbsp;&nbsp;<span style="color: var(--shimmer-a);">reconnect</span>: { <span style="color: var(--shimmer-a);">initial</span>: <span style="color: #d8b878;">1</span>, <span style="color: var(--shimmer-a);">max</span>: <span style="color: #d8b878;">30</span> }</div>
+              <div>&nbsp;</div>
+              <div><span style="color: var(--shimmer-a);">bus</span>:</div>
+              <div>&nbsp;&nbsp;<span style="color: var(--shimmer-a);">consumer_queue_size</span>: <span style="color: #d8b878;">1000</span></div>
+              <div>&nbsp;&nbsp;<span style="color: var(--shimmer-a);">sustained_overflow_drops</span>: <span style="color: #d8b878;">100</span></div>
+              <div>&nbsp;</div>
+              <div><span style="color: var(--shimmer-a);">ws_server</span>:    { <span style="color: var(--shimmer-a);">host</span>: <span style="color: #d8b878;">0.0.0.0</span>, <span style="color: var(--shimmer-a);">port</span>: <span style="color: #d8b878;">8765</span> }</div>
+              <div><span style="color: var(--shimmer-a);">status_server</span>: { <span style="color: var(--shimmer-a);">host</span>: <span style="color: #d8b878;">0.0.0.0</span>, <span style="color: var(--shimmer-a);">port</span>: <span style="color: #d8b878;">8080</span> }</div>
+              <div>&nbsp;</div>
+              <div><span style="color: var(--shimmer-a);">log_level</span>: <span style="color: #d8b878;">INFO</span></div>
+              <div><span style="color: var(--ink-faint);"># every key overridable via MDB_* env</span></div>
+            </div>
+          </div>
+        </div>
+
+        <!-- RIGHT: API endpoint catalog -->
+        <div class="diag-card" style="padding: 28px 32px;">
+          <div class="diag-caption">API surface · WS · MCP · HTTP</div>
+          <div style="display: flex; flex-direction: column; gap: 8px; margin-top: 12px;">
+            <div style="display: flex; align-items: center; gap: 14px; padding: 11px 16px; background: var(--bg-deep); border: 1px solid var(--line-2); border-radius: 10px;">
+              <span style="font-family: var(--mono); font-size: 11px; padding: 3px 9px; border-radius: 6px; background: var(--shimmer-a); color: #1a2a3a; font-weight: 600;">WS</span>
+              <span style="font-family: var(--mono); font-size: 13px; color: var(--ink);">subscribe</span>
+              <span style="margin-left: auto; font-family: var(--mono); font-size: 11.5px; color: var(--ink-mute);">{ action, topics[] }</span>
+            </div>
+            <div style="display: flex; align-items: center; gap: 14px; padding: 11px 16px; background: var(--bg-deep); border: 1px solid var(--line-2); border-radius: 10px;">
+              <span style="font-family: var(--mono); font-size: 11px; padding: 3px 9px; border-radius: 6px; background: var(--shimmer-a); color: #1a2a3a; font-weight: 600;">WS</span>
+              <span style="font-family: var(--mono); font-size: 13px; color: var(--ink);">unsubscribe</span>
+              <span style="margin-left: auto; font-family: var(--mono); font-size: 11.5px; color: var(--ink-mute);">{ action, topics[] }</span>
+            </div>
+            <div style="display: flex; align-items: center; gap: 14px; padding: 11px 16px; background: var(--bg-deep); border: 1px solid var(--line-2); border-radius: 10px;">
+              <span style="font-family: var(--mono); font-size: 11px; padding: 3px 9px; border-radius: 6px; background: var(--shimmer-b); color: #1a2a3a; font-weight: 600;">MCP</span>
+              <span style="font-family: var(--mono); font-size: 13px; color: var(--ink);">list_topics</span>
+              <span style="margin-left: auto; font-family: var(--mono); font-size: 11.5px; color: var(--ink-mute);">() → topic taxonomy</span>
+            </div>
+            <div style="display: flex; align-items: center; gap: 14px; padding: 11px 16px; background: var(--bg-deep); border: 1px solid var(--line-2); border-radius: 10px;">
+              <span style="font-family: var(--mono); font-size: 11px; padding: 3px 9px; border-radius: 6px; background: var(--shimmer-b); color: #1a2a3a; font-weight: 600;">MCP</span>
+              <span style="font-family: var(--mono); font-size: 13px; color: var(--ink);">describe_topic</span>
+              <span style="margin-left: auto; font-family: var(--mono); font-size: 11.5px; color: var(--ink-mute);">(topic) → schema + cadence</span>
+            </div>
+            <div style="display: flex; align-items: center; gap: 14px; padding: 11px 16px; background: var(--bg-deep); border: 1px solid var(--line-2); border-radius: 10px;">
+              <span style="font-family: var(--mono); font-size: 11px; padding: 3px 9px; border-radius: 6px; background: var(--shimmer-b); color: #1a2a3a; font-weight: 600;">MCP</span>
+              <span style="font-family: var(--mono); font-size: 13px; color: var(--ink);">get_snapshot</span>
+              <span style="margin-left: auto; font-family: var(--mono); font-size: 11.5px; color: var(--ink-mute);">(product_id) → top-of-book</span>
+            </div>
+            <div style="display: flex; align-items: center; gap: 14px; padding: 11px 16px; background: var(--bg-deep); border: 1px solid var(--line-2); border-radius: 10px;">
+              <span style="font-family: var(--mono); font-size: 11px; padding: 3px 9px; border-radius: 6px; background: var(--shimmer-b); color: #1a2a3a; font-weight: 600;">MCP</span>
+              <span style="font-family: var(--mono); font-size: 13px; color: var(--ink);">stream_topic</span>
+              <span style="margin-left: auto; font-family: var(--mono); font-size: 11.5px; color: var(--ink-mute);">(topic, n, ms) → frames</span>
+            </div>
+            <div style="display: flex; align-items: center; gap: 14px; padding: 11px 16px; background: var(--bg-deep); border: 1px solid var(--line-2); border-radius: 10px;">
+              <span style="font-family: var(--mono); font-size: 11px; padding: 3px 9px; border-radius: 6px; background: var(--shimmer-b); color: #1a2a3a; font-weight: 600;">MCP</span>
+              <span style="font-family: var(--mono); font-size: 13px; color: var(--ink);">get_hub_status</span>
+              <span style="margin-left: auto; font-family: var(--mono); font-size: 11.5px; color: var(--ink-mute);">() → registry state</span>
+            </div>
+            <div style="display: flex; align-items: center; gap: 14px; padding: 11px 16px; background: var(--bg-deep); border: 1px solid var(--line-2); border-radius: 10px;">
+              <span style="font-family: var(--mono); font-size: 11px; padding: 3px 9px; border-radius: 6px; background: var(--shimmer-c); color: #1a2a3a; font-weight: 600;">HTTP</span>
+              <span style="font-family: var(--mono); font-size: 13px; color: var(--ink);">GET /status</span>
+              <span style="margin-left: auto; font-family: var(--mono); font-size: 11.5px; color: var(--ink-mute);">→ live registry json</span>
+            </div>
+            <div style="display: flex; align-items: center; gap: 14px; padding: 11px 16px; background: var(--bg-deep); border: 1px solid var(--line-2); border-radius: 10px;">
+              <span style="font-family: var(--mono); font-size: 11px; padding: 3px 9px; border-radius: 6px; background: var(--shimmer-c); color: #1a2a3a; font-weight: 600;">HTTP</span>
+              <span style="font-family: var(--mono); font-size: 13px; color: var(--ink);">GET /healthz</span>
+              <span style="margin-left: auto; font-family: var(--mono); font-size: 11.5px; color: var(--ink-mute);">→ 200 ok</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="footer"><span>06 · config + api</span><span>06 / 13</span></div>
+  </section>
+
+
+
+  <!-- ====================================================== -->
+  <!-- SLIDE 5 — TOPIC TAXONOMY (centered card)                 -->
+  <!-- ====================================================== -->
+  <section data-screen-label="05 Topics">
+    <div class="nav">
+      <div class="brand"><div class="glyph">M</div>Market Data Broker</div>
+      <div class="links"><span>Overview</span><span>Architecture</span><span>Demo</span><span>Docs</span></div>
+      <div class="cta"></div>
+    </div>
+
+    <div class="slide-pad">
+      <div class="two-up">
+        <div>
+          <div class="eyebrow"><span class="dot"></span>Topic taxonomy</div>
+          <h2 class="h-section" style="font-size: 76px;">Subscribe to anything <span class="shimmer">in three dots.</span></h2>
+          <p class="lede-md">Topics are dotted strings — <span class="mono">{venue}.{channel}.{product_id}</span>. Venue-first leaves room for <span class="mono">binance.*</span> without schema changes. Payloads are JSON Message envelopes; all numerics are strings end-to-end (Decimal precision — no float loss). Tools tell LLMs to use <span class="mono">Decimal</span> before any arithmetic.</p>
+          <div style="margin-top: 32px; display: flex; flex-direction: column; gap: 14px; max-width: 560px;">
+            <div style="display: flex; gap: 16px; padding: 16px 20px; background: var(--panel); border-radius: 14px;">
+              <span class="mono" style="color: var(--shimmer-a); font-size: 15px;">ticker</span>
+              <span style="color: var(--ink-dim); font-size: 15px;">trade tick + post-trade top-of-book · ~5 Hz on BTC-USD · price/best_bid/best_ask as strings</span>
+            </div>
+            <div style="display: flex; gap: 16px; padding: 16px 20px; background: var(--panel); border-radius: 14px;">
+              <span class="mono" style="color: var(--shimmer-a); font-size: 15px;">matches</span>
+              <span style="color: var(--ink-dim); font-size: 15px;">fills · one frame per executed trade · price, size, taker side</span>
+            </div>
+            <div style="display: flex; gap: 16px; padding: 16px 20px; background: var(--panel); border-radius: 14px;">
+              <span class="mono" style="color: var(--shimmer-a); font-size: 15px;">level2_batch</span>
+              <span style="color: var(--ink-dim); font-size: 15px;">top-50 L2 book snapshot on subscribe, then incremental diffs · stamps last_update_at</span>
+            </div>
+          </div>
+        </div>
+        <div class="topic-card">
+          <div class="topic-search">
+            <div class="ai-orb"></div>
+            <div class="ph">Subscribe to a topic…</div>
+            <div style="font-family: var(--mono); font-size: 12px; color: #6b7d77;">⌘K</div>
+          </div>
+          <div class="topic-list">
+            <div class="topic-row"><span class="pin"></span><span class="topic-mono">coinbase.ticker.BTC-USD</span><span class="topic-rate">~5 Hz</span></div>
+            <div class="topic-row"><span class="pin"></span><span class="topic-mono">coinbase.ticker.ETH-USD</span><span class="topic-rate">~3 Hz</span></div>
+            <div class="topic-row"><span class="pin"></span><span class="topic-mono">coinbase.matches.BTC-USD</span><span class="topic-rate">per trade</span></div>
+            <div class="topic-row"><span class="pin" style="background:#cdd1cf"></span><span class="topic-mono" style="color:#6b7d77">coinbase.level2_batch.SOL-USD</span><span class="topic-rate">idle</span></div>
+            <div class="topic-row"><span class="pin" style="background:#cdd1cf"></span><span class="topic-mono" style="color:#6b7d77">binance.ticker.BTC-USDT</span><span class="topic-rate">v2</span></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="footer"><span>07 · topics</span><span>07 / 13</span></div>
+  </section>
+
+  <!-- ====================================================== -->
+  <!-- SLIDE 6 — DEMAND-DRIVEN (image-right)                    -->
+  <!-- ====================================================== -->
+  <section data-screen-label="06 Demand">
+    <div class="nav">
+      <div class="brand"><div class="glyph">M</div>Market Data Broker</div>
+      <div class="links"><span>Overview</span><span>Architecture</span><span>Demo</span><span>Docs</span></div>
+      <div class="cta"></div>
+    </div>
+
+    <div class="slide-pad">
+      <div class="two-up">
+        <div>
+          <div class="eyebrow"><span class="dot"></span>The hinge</div>
+          <h2 class="h-section">No leaked upstream <span class="shimmer">subscriptions.</span></h2>
+          <p class="lede-md">The registry holds <span class="mono">dict[topic, set[consumer_id]]</span>. The first holder triggers <span class="mono">on_first_subscriber(topic)</span> — ingest sends a Coinbase SUBSCRIBE frame. The last holder release triggers <span class="mono">on_last_unsubscriber(topic)</span> — ingest sends UNSUBSCRIBE. Both callbacks are async and run on the same event loop, no locks. The snapshot cache only watches the bus directly, not the registry — so it caches state without creating artificial demand.</p>
+        </div>
+        <div class="image-card shimmer-bg">
+          <div style="width: 78%; display: flex; flex-direction: column; gap: 16px; font-family: var(--mono);">
+            <div style="background: var(--bg-deep); padding: 18px 22px; border-radius: 14px; color: var(--ink); font-size: 15px;">
+              <div style="color: var(--ink-faint); font-size: 12px; margin-bottom: 8px;">t = 0</div>
+              upstream subs: <span style="color: var(--shimmer-a)">[ ]</span>
+            </div>
+            <div style="background: var(--bg-deep); padding: 18px 22px; border-radius: 14px; color: var(--ink); font-size: 15px;">
+              <div style="color: var(--ink-faint); font-size: 12px; margin-bottom: 8px;">t = 1 — client A subscribes BTC ticker</div>
+              upstream subs: <span style="color: var(--shimmer-a)">[ ticker.BTC-USD ]</span>
+            </div>
+            <div style="background: var(--bg-deep); padding: 18px 22px; border-radius: 14px; color: var(--ink); font-size: 15px;">
+              <div style="color: var(--ink-faint); font-size: 12px; margin-bottom: 8px;">t = 2 — clients B, C join</div>
+              upstream subs: <span style="color: var(--shimmer-a)">[ ticker.BTC-USD ]</span>  <span style="color: var(--ink-mute);">// still 1 upstream Coinbase sub · ref-count = 3</span>
+            </div>
+            <div style="background: linear-gradient(135deg, var(--shimmer-a), var(--shimmer-b)); padding: 18px 22px; border-radius: 14px; color: #1a2a3a; font-size: 15px; font-weight: 500;">
+              <div style="color: rgba(26,42,58,0.65); font-size: 12px; margin-bottom: 8px;">t = 3 — all leave</div>
+              upstream subs: <span style="font-weight: 700;">[ ]</span>  <span style="color: rgba(26,42,58,0.7);">// last holder gone → on_last_unsubscriber → UNSUBSCRIBE upstream</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="footer"><span>08 · demand-driven</span><span>08 / 13</span></div>
+  </section>
+
+  <!-- ============================ -->
+  <!-- INJECTED · 08 Failure modes  -->
+  <!-- ============================ -->
+  <section data-screen-label="04l Failures">
+    <div class="nav">
+      <div class="brand"><div class="glyph">M</div>Market Data Broker</div>
+      <div class="links"><span>Overview</span><span>Architecture</span><span>Demo</span><span>Docs</span></div>
+      <div class="cta"></div>
+    </div>
+
+    <div class="slide-pad">
+      <div class="eyebrow"><span class="dot"></span>Failure modes · resilience matrix</div>
+      <h2 class="h-section" style="font-size: 64px;">What breaks, what <span class="shimmer">recovers.</span></h2>
+
+      <div class="diag-card" style="margin-top: 36px;">
+        <div class="diag-caption">Each row: what fails, how we notice, what we do, who feels it</div>
+
+        <div style="display: grid; grid-template-columns: 1.4fr 1fr 1.2fr 1fr; gap: 0; margin-top: 12px;">
+          <!-- header -->
+          <div style="padding: 14px 18px; color: var(--ink-faint); font-family: var(--mono); font-size: 11px; letter-spacing: 0.12em; text-transform: uppercase; border-bottom: 1px solid var(--line-2);">Failure</div>
+          <div style="padding: 14px 18px; color: var(--ink-faint); font-family: var(--mono); font-size: 11px; letter-spacing: 0.12em; text-transform: uppercase; border-bottom: 1px solid var(--line-2);">Detection</div>
+          <div style="padding: 14px 18px; color: var(--ink-faint); font-family: var(--mono); font-size: 11px; letter-spacing: 0.12em; text-transform: uppercase; border-bottom: 1px solid var(--line-2);">Recovery</div>
+          <div style="padding: 14px 18px; color: var(--ink-faint); font-family: var(--mono); font-size: 11px; letter-spacing: 0.12em; text-transform: uppercase; border-bottom: 1px solid var(--line-2);">Blast radius</div>
+
+          <!-- row 1 -->
+          <div style="padding: 18px; color: var(--ink); font-size: 15px; border-bottom: 1px solid var(--line);"><strong>Upstream WS drops</strong></div>
+          <div style="padding: 18px; color: var(--ink-dim); font-size: 14px; border-bottom: 1px solid var(--line);">watchdog · no frame for 30s</div>
+          <div style="padding: 18px; color: var(--ink-dim); font-size: 14px; border-bottom: 1px solid var(--line);">reconnect with exp backoff (1→30s)</div>
+          <div style="padding: 18px; border-bottom: 1px solid var(--line);"><span class="lane-pill" style="font-size: 11px;">all topics paused</span></div>
+
+          <!-- row 2 -->
+          <div style="padding: 18px; color: var(--ink); font-size: 15px; border-bottom: 1px solid var(--line);"><strong>Slow consumer</strong></div>
+          <div style="padding: 18px; color: var(--ink-dim); font-size: 14px; border-bottom: 1px solid var(--line);">queue fills past 1000 deep</div>
+          <div style="padding: 18px; color: var(--ink-dim); font-size: 14px; border-bottom: 1px solid var(--line);">drop oldest message · per-consumer counter</div>
+          <div style="padding: 18px; border-bottom: 1px solid var(--line);"><span class="lane-pill dim" style="font-size: 11px;">that consumer only</span></div>
+
+          <!-- row 3 -->
+          <div style="padding: 18px; color: var(--ink); font-size: 15px; border-bottom: 1px solid var(--line);"><strong>Malformed upstream payload</strong></div>
+          <div style="padding: 18px; color: var(--ink-dim); font-size: 14px; border-bottom: 1px solid var(--line);">Pydantic validation at ingest</div>
+          <div style="padding: 18px; color: var(--ink-dim); font-size: 14px; border-bottom: 1px solid var(--line);">discard one frame · structured log</div>
+          <div style="padding: 18px; border-bottom: 1px solid var(--line);"><span class="lane-pill dim" style="font-size: 11px;">single message</span></div>
+
+          <!-- row 4 -->
+          <div style="padding: 18px; color: var(--ink); font-size: 15px; border-bottom: 1px solid var(--line);"><strong>Consumer disconnect mid-tick</strong></div>
+          <div style="padding: 18px; color: var(--ink-dim); font-size: 14px; border-bottom: 1px solid var(--line);">WS close or send error</div>
+          <div style="padding: 18px; color: var(--ink-dim); font-size: 14px; border-bottom: 1px solid var(--line);">detach holder · refcount drops</div>
+          <div style="padding: 18px; border-bottom: 1px solid var(--line);"><span class="lane-pill dim" style="font-size: 11px;">none</span></div>
+
+          <!-- row 5 -->
+          <div style="padding: 18px; color: var(--ink); font-size: 15px;"><strong>Process restart</strong></div>
+          <div style="padding: 18px; color: var(--ink-dim); font-size: 14px;">/healthz fails · k8s restarts pod</div>
+          <div style="padding: 18px; color: var(--ink-dim); font-size: 14px;">cold start · clients reconnect · ~3s</div>
+          <div style="padding: 18px;"><span class="lane-pill" style="font-size: 11px;">~3s window</span></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="footer"><span>09 · failure modes</span><span>09 / 13</span></div>
+  </section>
+
+
+  <!-- ====================================================== -->
+  <!-- SLIDE 7 — DEMO PLAN (feature grid)                       -->
+  <!-- ====================================================== -->
+  <section data-screen-label="07 Demo">
+    <div class="nav">
+      <div class="brand"><div class="glyph">M</div>Market Data Broker</div>
+      <div class="links"><span>Overview</span><span>Architecture</span><span>Demo</span><span>Docs</span></div>
+      <div class="cta"></div>
+    </div>
+
+    <div class="slide-pad">
+      <div class="eyebrow"><span class="dot"></span>Live demo</div>
+      <h2 class="h-section" style="font-size: 72px;">Three ways to <span class="shimmer">talk to the broker.</span></h2>
+
+      <div class="feature-grid">
+        <div class="feature-card">
+          <div class="visual">
+            <div class="vlines">
+              <div class="vline short"></div>
+              <div class="vline med"></div>
+              <div class="vline shimmer-bar"></div>
+              <div class="vline short"></div>
+            </div>
+          </div>
+          <h3>1 · Plain WebSocket</h3>
+          <p><span class="mono">smoke_ws_client.py coinbase.ticker.BTC-USD 5</span> — prints 5 live ticks then unsubscribes cleanly. Exercises every layer: WS server → registry add → ingest 0→1 → Coinbase SUBSCRIBE → bus → drop-oldest under load → registry remove → ingest 1→0 → UNSUBSCRIBE.</p>
+          <span class="more">terminal walkthrough</span>
+        </div>
+        <div class="feature-card">
+          <div class="visual shimmer-bg"><div class="orb" style="width: 90px; height: 90px;"></div></div>
+          <h3>2 · MCP Inspector</h3>
+          <p>Browser UI to drive each MCP tool by hand — <span class="mono">list_topics</span>, <span class="mono">describe_topic</span>, <span class="mono">get_snapshot</span>, <span class="mono">stream_topic</span>, <span class="mono">get_hub_status</span>. Verifies schemas, error envelopes, and frame shapes before any LLM is involved. Pre-wired by <span class="mono">scripts/mcp_inspector.sh</span>.</p>
+          <span class="more">tool-by-tool walkthrough</span>
+        </div>
+        <div class="feature-card" style="background: linear-gradient(135deg, var(--shimmer-a), var(--shimmer-b)); color: #1a2a3a;">
+          <div class="visual" style="background: rgba(255,255,255,0.18);">
+            <div class="vbubbles">
+              <div class="vbubble" style="background: rgba(255,255,255,0.85); color: #1a2a3a;">What's BTC doing right now?</div>
+              <div class="vbubble out" style="background: #0a3d33; color: var(--ink);">$67,421 · last trade 2s ago</div>
+            </div>
+          </div>
+          <h3 style="color: #1a2a3a;">3 · Claude Desktop</h3>
+          <p style="color: rgba(26,42,58,0.78);">Full LLM agent loop end-to-end. Same MCP server, real conversations against live Coinbase. The agent picks tools by reading the four context docs in <span class="mono">docs/</span> — that is the LLM-usability evaluation criterion in action.</p>
+          <span class="more" style="color: #1a2a3a;">end-to-end walkthrough</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="footer"><span>10 · demo plan</span><span>10 / 13</span></div>
+  </section>
+
+  <!-- ====================================================== -->
+  <!-- SLIDE 8 — STATS / LIFECYCLE PROOF                         -->
+  <!-- ====================================================== -->
+  <section data-screen-label="08 Lifecycle">
+    <div class="nav">
+      <div class="brand"><div class="glyph">M</div>Market Data Broker</div>
+      <div class="links"><span>Overview</span><span>Architecture</span><span>Demo</span><span>Docs</span></div>
+      <div class="cta"></div>
+    </div>
+
+    <div class="slide-pad">
+      <div class="eyebrow"><span class="dot"></span>Lifecycle proof</div>
+      <h2 class="h-section" style="font-size: 76px;">Three clients, two topics, <span class="shimmer">zero leaks.</span></h2>
+      <p class="lede-md">The <span class="mono">scripts/demo_multi_client.sh</span> orchestrator spawns 3 WebSocket clients across 2 topics, kills them in sequence, and queries <span class="mono">/status</span> at each transition. Upstream subscriptions shrink in lockstep with downstream demand. End-state: zero upstream subs, zero leaks. Verified live and pinned in tests.</p>
+
+      <div class="stat-row">
+        <div class="stat-card">
+          <div class="num"><span class="shimmer">1</span></div>
+          <div class="lbl">Upstream connection</div>
+          <div class="desc">One Coinbase WSS connection — multiplexed across all consumers and topics by the bus.</div>
+        </div>
+        <div class="stat-card">
+          <div class="num">N</div>
+          <div class="lbl">Downstream consumers</div>
+          <div class="desc">WS clients, MCP tools, ops endpoints — peers on the bus, equal first-class consumers.</div>
+        </div>
+        <div class="stat-card">
+          <div class="num"><span class="shimmer">0</span></div>
+          <div class="lbl">Leaked subscriptions</div>
+          <div class="desc">Across 239 ruff-clean tests · verified live against Coinbase · ~3s graceful shutdown.</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="footer"><span>11 · lifecycle</span><span>11 / 13</span></div>
+  </section>
+
+  <!-- ====================================================== -->
+  <!-- SLIDE 9 — TRADE-OFFS (FAQ-style list)                     -->
+  <!-- ====================================================== -->
+  <section data-screen-label="09 Tradeoffs">
+    <div class="nav">
+      <div class="brand"><div class="glyph">M</div>Market Data Broker</div>
+      <div class="links"><span>Overview</span><span>Architecture</span><span>Demo</span><span>Docs</span></div>
+      <div class="cta"></div>
+    </div>
+
+    <div class="slide-pad">
+      <div class="eyebrow"><span class="dot"></span>Trade-offs</div>
+      <h2 class="h-section" style="font-size: 76px;">What's <span class="shimmer">deliberate</span>, what's deferred.</h2>
+
+      <div class="faq-list">
+        <div class="faq-row">
+          <span>In-memory only · no database, no persistence</span>
+          <span class="a">A streaming pipe, not a database. On restart we lose the snapshot cache + consumer subs; ingest reconciles upstream from new demand. Documented in the README.</span>
+          <span class="plus">+</span>
+        </div>
+        <div class="faq-row">
+          <span>Drop-oldest backpressure, per consumer</span>
+          <span class="a">A slow consumer cannot stall the broker or peers — its own backlog gets trimmed. Drops surface per-consumer in <span class="mono">/status</span>. Sustained drops > 100 close the WS with code 1013.</span>
+          <span class="plus">+</span>
+        </div>
+        <div class="faq-row">
+          <span>Single venue today — Coinbase only</span>
+          <span class="a">Topic strings are venue-prefixed. Adding <span class="mono">binance.*</span> is one new ingest module that publishes the same envelope — bus, registry, snapshot, and surfaces don't change.</span>
+          <span class="plus">+</span>
+        </div>
+        <div class="faq-row">
+          <span>No auth on public surfaces</span>
+          <span class="a">Designed for an internal trusted network. JWT or mTLS would live at the server-surface layer — bus and registry stay protocol-agnostic.</span>
+          <span class="plus">+</span>
+        </div>
+        <div class="faq-row">
+          <span>Vertical scale only</span>
+          <span class="a">Horizontal scale would shard by topic behind a broker like NATS or Redis Streams. Out of scope for the MVP; the layered design leaves a clean seam for it.</span>
+          <span class="plus">+</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="footer"><span>12 · trade-offs</span><span>12 / 13</span></div>
+  </section>
+
+  <!-- ====================================================== -->
+  <!-- SLIDE 10 — CLOSING / Q&A                                 -->
+  <!-- ====================================================== -->
+  <section data-screen-label="10 QA">
+    <div class="nav">
+      <div class="brand"><div class="glyph">M</div>Market Data Broker</div>
+      <div class="links"><span>Overview</span><span>Architecture</span><span>Demo</span><span>Docs</span></div>
+      <div class="cta"></div>
+    </div>
+
+    <div class="closing-hero">
+      <div class="eyebrow" style="margin-bottom: 40px;"><span class="dot"></span>End of demo</div>
+      <h1>Thanks, Silver 8. <span class="shimmer">Questions?</span></h1>
+      <p class="lede">github.com/weyseing/market_data_broker · 239 tests · ruff clean · ~3s graceful shutdown · single-container Docker deploy · LLM context docs in <span class="mono">docs/</span> (context · topics · worked_examples · failure_modes) · architecture write-up in <span class="mono">docs/architecture.md</span></p>
+      
+    </div>
+
+    <div class="footer"><span>Jeremy Heng · engineering manager · may 2026</span><span>13 / 13</span></div>
+  </section>
+
+</deck-stage>
+
+
+
+
+<div class="deck-controls" role="toolbar" aria-label="Deck controls">
+  <button type="button" id="btn-present" onclick="togglePresent()" title="Toggle fullscreen (F)">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 3H5a2 2 0 0 0-2 2v3"/><path d="M21 8V5a2 2 0 0 0-2-2h-3"/><path d="M3 16v3a2 2 0 0 0 2 2h3"/><path d="M16 21h3a2 2 0 0 0 2-2v-3"/></svg>
+    Present
+  </button>
+  <button type="button" id="btn-pdf" onclick="exportPDF()" title="Save the deck as PDF (browser print dialog)">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+    Export PDF
+  </button>
+</div>
+
+
+<script>
+  function togglePresent() {
+    if (document.fullscreenElement || document.webkitFullscreenElement) {
+      (document.exitFullscreen || document.webkitExitFullscreen).call(document);
+    } else {
+      const el = document.documentElement;
+      const req = el.requestFullscreen || el.webkitRequestFullscreen;
+      if (req) req.call(el).catch(() => {});
+    }
+  }
+  function exportPDF() {
+    // The deck-stage component ships an @media print rule that lays out one
+    // slide per page at design size — the browser's Print → Save as PDF
+    // produces a clean one-page-per-slide PDF with no extra deps.
+    window.print();
+  }
+  // Keyboard shortcuts: F = present toggle, P = print/export
+  document.addEventListener('keydown', (e) => {
+    if (e.target && (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA')) return;
+    if (e.key === 'f' || e.key === 'F') { e.preventDefault(); togglePresent(); }
+    if ((e.key === 'p' || e.key === 'P') && (e.metaKey || e.ctrlKey)) {
+      // Let the browser handle Cmd/Ctrl+P naturally; window.print() would double-fire.
+      return;
+    }
+  });
+</script>
+
+</body></html>
