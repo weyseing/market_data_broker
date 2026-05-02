@@ -11,9 +11,9 @@ STATUS
   [x] Step 5     — Coinbase ingestion (real)            (done 2026-04-26)
   [x] Step 6     — Snapshot store                        (done 2026-05-01)
   [x] Step 7     — Downstream WebSocket server          (done 2026-05-01)
-  [ ] Step 8     — MCP server (stdio + http)            ← deferred (resume later)
-  [~] Step 9     — Context documentation in /docs       (3 of 4 docs landed 2026-05-01;
-                                                         worked_examples.md awaits Step 8)
+  [x] Step 8     — MCP server (stdio + http)            (done 2026-05-02)
+  [x] Step 9     — Context documentation in /docs       (done 2026-05-02; worked_examples.md
+                                                         landed alongside Step 8)
   [x] Step 10    — Operational polish                   (done 2026-05-01)
   [x] Step 11    — Containerisation + architecture write-up  (done 2026-05-01)
 
@@ -246,7 +246,7 @@ Step 7  — Downstream WebSocket server                                       [D
              surface goes up only once the inner layers are ready to accept
              demand. Stop order is the mirror: WS first, ingest, snapshot.
 
-Step 8  — MCP server
+Step 8  — MCP server                                                       [DONE]
   server/mcp_server.py with FastMCP. Tools (LLM-first names + descriptions):
     list_topics()
     describe_topic(topic)
@@ -255,16 +255,59 @@ Step 8  — MCP server
     stream_topic(topic, max_messages=100, timeout_ms=5000)   # poll-based batch
   Wired to same bus / registry / snapshot.
   Expose BOTH transports:
-    `market-data-broker mcp --stdio`   (default, for local Claude Desktop)
-    `market-data-broker mcp --http`    (for Docker / remote agents)
+    `python -m market_data_broker mcp --stdio`   (default, for Claude Desktop)
+    `python -m market_data_broker mcp --http`    (for Docker / remote agents)
   Verify: MCP inspector exercises every tool over stdio AND http; schemas render correctly.
+  Outcome: 22 new tests green; full suite 239/239; ruff clean.
+           Manual JSON-RPC framing test against stdio: initialize handshake,
+           tools/list (5 tools, schemas + descriptions), tools/call list_topics
+           — all returned correct structured content. HTTP transport: real
+           POST against /mcp returned SSE-framed initialize reply; ingest
+           connected to real Coinbase during the same boot.
+           Decisions worth flagging:
+           - Tool methods are also plain ``tool_*`` Python callables on the
+             server class. FastMCP's @tool decorator wraps thin closures around
+             them. Tests exercise the methods directly (fast, no transport)
+             and verify FastMCP discovery separately via ``app.list_tools()``.
+           - ``stream_topic`` registers a transient registry consumer named
+             ``mcp-stream-N`` (not a bus subscription). Going through the
+             registry is intentional: drives ingest sub/unsub on a 0→1 / 1→0
+             transition exactly like a WS client would. The ``finally`` in
+             the tool unregisters the consumer, so cancellation / exception
+             paths can't leak upstream subs. Pinned by
+             test_stream_topic_unregisters_on_exception.
+           - Hard caps (max_messages=5000, timeout_ms=60000) clamp at
+             tool-entry; we report ``truncated_*`` flags so a buggy LLM caller
+             can't ask for unbounded work but still gets a response shape it
+             can reason about.
+           - The MCP entrypoint is a separate run mode in __main__
+             (``python -m market_data_broker mcp [--stdio|--http]``). Stdio
+             mode owns stdout for JSON-RPC framing — configure_logging now
+             accepts a ``stream`` arg and the entrypoint passes ``sys.stderr``
+             so structlog doesn't corrupt the protocol channel. ``logging.basicConfig``
+             gained ``force=True`` for the same reason.
+           - Hub mode and MCP mode share _build_core() (bus + ingest + snapshot
+             + registry); the difference is purely which public surfaces are
+             added on top. Today they run as separate processes, so a single
+             box wanting both can run two compose services with different
+             commands. Composing them in-process is a small extension if
+             needed later — they're already isolated by transport.
+           - describe_topic catalogue is inline (not file-loaded) so stdio
+             deployments — where the hub is spawned by Claude Desktop and
+             may not have the repo on disk — still get full schema + example
+             responses.
 
-Step 9  — Context documentation in /docs
+Step 9  — Context documentation in /docs                                    [DONE]
   context.md         — purpose, scope, non-goals
   topics.md          — every topic: schema, cadence, real example payload
   worked_examples.md — agent walkthroughs ("get current mid for BTC-USD → call X with Y → expect Z")
   failure_modes.md   — stale topic, dropped conn, unknown symbol, hub restart
   Verify: hand docs+toolset to a fresh agent, it completes a sample task on first try.
+  Outcome: All 4 docs landed. worked_examples.md added alongside Step 8 with five
+           concrete recipes (mid for BTC-USD, sample trades, direction in last N
+           ticks, hub-health check, cold-start discovery) plus an anti-pattern
+           table and a one-line cheat sheet. context.md / README updated to drop
+           the "MCP — pending" qualifier and document the actual `mcp` subcommand.
 
 Step 10 — Operational polish
   YAML config + env-var overrides (config.py).

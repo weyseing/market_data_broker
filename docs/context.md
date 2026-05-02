@@ -33,11 +33,11 @@ Two separate surfaces; pick whichever fits the caller:
 
 | Surface | Best for | Endpoint |
 |---|---|---|
-| **MCP** *(Step 8 — pending)* | LLM agents, Claude Desktop | tools over stdio or HTTP |
+| **MCP** | LLM agents, Claude Desktop | tools over stdio (`mcp --stdio`) or streamable-HTTP (`mcp --http`) |
 | **WebSocket** | Internal services, browser code, scripts | `ws://hub:8765` |
 | **HTTP `/status`** | Operators, container health checks | `http://hub:8080/status` |
 
-The MCP surface is what an LLM agent normally uses. Tools (when implemented):
+The MCP surface is what an LLM agent normally uses. Tools:
 
 - `list_topics()` — enumerate available topics with cadence + venue + channel.
 - `describe_topic(topic)` — full schema and a real example payload.
@@ -78,8 +78,8 @@ Examples:
 - [topics.md](topics.md) — every topic's schema, cadence, real example payload.
 - [failure_modes.md](failure_modes.md) — what you see when something goes
   wrong (stale data, hub reconnecting, unknown symbol, etc.) and how to handle it.
-- [worked_examples.md](worked_examples.md) — *(Step 9 finish — pending)* end-to-end
-  recipes ("get current mid for BTC-USD" → tool calls → answer).
+- [worked_examples.md](worked_examples.md) — end-to-end recipes
+  ("get current mid for BTC-USD" → tool calls → answer).
 - [architecture.md](architecture.md) — for engineers; design write-up and
   extension paths.
 

@@ -1,23 +1,29 @@
 """Entry point for ``python -m market_data_broker``.
 
-Wires bus + registry + Coinbase ingest + downstream WebSocket server. The MCP
-server (Step 8) is still pending, so this module also supports an
-operator-driven debug consumer for manual verification of the ingest path
-without needing a WS client.
+Two run modes:
+
+- **hub** (default) — bus + Coinbase ingest + downstream WebSocket + HTTP
+  /status. The standard server deployment.
+- **mcp** — bus + ingest + snapshot + an MCP server (stdio or streamable-http
+  transport). Used by LLM agents (Claude Desktop, MCP inspector, remote agents).
 
 Manual smoke tests against real Coinbase::
 
-    # Logs every message at INFO directly from a registered consumer.
+    # Hub mode (default).
+    python -m market_data_broker
+
+    # MCP over stdio (Claude Desktop / inspector).
+    python -m market_data_broker mcp --stdio
+
+    # MCP over streamable-HTTP on port 8000 by default.
+    python -m market_data_broker mcp --http
+
+    # Hub mode + a debug consumer for ingest verification without a WS client.
     MDB_DEBUG_SUBSCRIBE=coinbase.ticker.BTC-USD python -m market_data_broker
 
-    # Connect a WS client (e.g. websocat) and drive subscriptions over the wire.
-    python -m market_data_broker
-    websocat ws://127.0.0.1:8765
-    > {"action":"subscribe","topics":["coinbase.ticker.BTC-USD"]}
-
 Both routes share the same registry, so refcounts compose: ingest only holds
-the upstream subscription while at least one of {WS clients, debug consumer}
-still wants the topic. Ctrl+C exits cleanly.
+the upstream subscription while at least one of {WS clients, MCP stream calls,
+debug consumer} still wants the topic. Ctrl+C exits cleanly.
 
 Runtime values (ports, URLs, timeouts, etc.) come from
 :func:`market_data_broker.config.load_config`. See ``.env.example`` for the
@@ -26,6 +32,7 @@ full list of env-var overrides.
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import contextlib
 import os
@@ -37,7 +44,11 @@ from market_data_broker.config import Config, ConfigError, load_config
 from market_data_broker.ingest.coinbase import CoinbaseIngest
 from market_data_broker.logging_config import configure_logging, get_logger
 from market_data_broker.registry import Registry
-from market_data_broker.server import DownstreamWSServer, StatusHTTPServer
+from market_data_broker.server import (
+    DownstreamWSServer,
+    MarketDataMCPServer,
+    StatusHTTPServer,
+)
 from market_data_broker.snapshot import SnapshotStore
 
 
@@ -59,10 +70,11 @@ async def _debug_consumer(registry: Registry, topics: list[str]) -> None:
         await registry.unregister_consumer("debug-cli")
 
 
-async def run(cfg: Config) -> None:
-    log = get_logger("hub")
-    log.info("hub.starting", version="0.1.0")
-
+def _build_core(cfg: Config) -> tuple[
+    InMemoryBus, Registry, CoinbaseIngest, SnapshotStore
+]:
+    """Build the shared in-process core. Wiring is identical between hub and
+    mcp modes; the difference is just which public surfaces get added on top."""
     bus = InMemoryBus(default_max_queue=cfg.bus.consumer_queue_size)
     ingest = CoinbaseIngest(
         bus=bus,
@@ -73,10 +85,6 @@ async def run(cfg: Config) -> None:
     )
     snapshot = SnapshotStore(bus)
 
-    # Compose: each topic transition fans out to both the ingest adapter
-    # (drives upstream sub/unsub) and the snapshot store (starts/stops
-    # observing the topic). Snapshot is a passive observer — it does NOT go
-    # through the registry, so it never pins a topic open against demand.
     async def on_first(topic: str) -> None:
         await ingest.on_first_subscriber(topic)
         await snapshot.track(topic)
@@ -85,13 +93,24 @@ async def run(cfg: Config) -> None:
         await ingest.on_last_unsubscriber(topic)
         await snapshot.untrack(topic)
 
-    registry = Registry(
-        bus,
-        on_first_subscriber=on_first,
-        on_last_unsubscriber=on_last,
-    )
+    registry = Registry(bus, on_first_subscriber=on_first, on_last_unsubscriber=on_last)
     ingest.attach_registry(registry)
+    return bus, registry, ingest, snapshot
 
+
+def _install_stop_signal(stop: asyncio.Event) -> None:
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        with contextlib.suppress(NotImplementedError):
+            loop.add_signal_handler(sig, stop.set)
+
+
+async def run_hub(cfg: Config) -> None:
+    """Hub mode — bus + ingest + WS server + HTTP /status. Runs until SIGINT."""
+    log = get_logger("hub")
+    log.info("hub.starting", version="0.1.0", mode="hub")
+
+    bus, registry, ingest, snapshot = _build_core(cfg)
     ws_server = DownstreamWSServer(
         registry,
         host=cfg.ws_server.host,
@@ -105,13 +124,8 @@ async def run(cfg: Config) -> None:
     )
 
     stop = asyncio.Event()
-    loop = asyncio.get_running_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, stop.set)
+    _install_stop_signal(stop)
 
-    # Start snapshot before ingest so the bus subscription is ready by the
-    # time the first frames flow. Public surfaces (WS, status HTTP) start
-    # last so inner layers are ready before we accept clients.
     await snapshot.start()
     await ingest.start()
     await ws_server.start()
@@ -132,26 +146,128 @@ async def run(cfg: Config) -> None:
             debug_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await debug_task
-        # Tear down outermost first: close public surfaces (status HTTP, WS),
-        # then ingest, then drain snapshot. Each layer's stop is idempotent
-        # so partial-startup teardown is safe too.
         await status_server.stop()
         await ws_server.stop()
         await ingest.stop()
         await snapshot.stop()
         log.info("hub.stopped")
+    # Bus is in-memory only — nothing to close.
+    del bus
+
+
+async def run_mcp(cfg: Config, *, transport: str, host: str, port: int) -> None:
+    """MCP mode — bus + ingest + snapshot + an MCP server.
+
+    Stdio transport returns when the client (Claude Desktop / inspector)
+    disconnects; HTTP transport runs until SIGINT. Either way, the surrounding
+    ``finally`` tears down ingest + snapshot cleanly.
+    """
+    log = get_logger("hub")
+    log.info("hub.starting", version="0.1.0", mode=f"mcp.{transport}")
+
+    _, registry, ingest, snapshot = _build_core(cfg)
+    mcp_server = MarketDataMCPServer(
+        registry=registry, snapshot=snapshot, host=host, port=port
+    )
+
+    await snapshot.start()
+    await ingest.start()
+    log.info("hub.ready")
+
+    runner: asyncio.Task[None]
+    if transport == "stdio":
+        runner = asyncio.create_task(mcp_server.run_stdio(), name="mcp-stdio")
+    elif transport == "http":
+        runner = asyncio.create_task(mcp_server.run_http(), name="mcp-http")
+    else:
+        raise ValueError(f"unknown transport {transport!r}")
+
+    stop = asyncio.Event()
+    _install_stop_signal(stop)
+
+    async def _wait_for_stop() -> None:
+        await stop.wait()
+
+    waiter = asyncio.create_task(_wait_for_stop(), name="mcp-stop-waiter")
+    try:
+        await asyncio.wait({runner, waiter}, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        log.info("hub.stopping")
+        runner.cancel()
+        waiter.cancel()
+        for t in (runner, waiter):
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await t
+        await ingest.stop()
+        await snapshot.stop()
+        log.info("hub.stopped")
+
+
+def _parse_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="market-data-broker",
+        description="Real-time crypto market-data hub with MCP interface.",
+    )
+    sub = parser.add_subparsers(dest="command", metavar="{hub,mcp}")
+
+    sub.add_parser("hub", help="Run the hub (WS + /status). Default if no command given.")
+
+    mcp = sub.add_parser("mcp", help="Run the MCP server.")
+    transport = mcp.add_mutually_exclusive_group()
+    transport.add_argument(
+        "--stdio",
+        dest="transport",
+        action="store_const",
+        const="stdio",
+        help="Speak MCP over stdin/stdout (default — for Claude Desktop / inspector).",
+    )
+    transport.add_argument(
+        "--http",
+        dest="transport",
+        action="store_const",
+        const="http",
+        help="Speak MCP over streamable-HTTP (for Docker / remote agents).",
+    )
+    mcp.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="HTTP bind host (only with --http). Default: 127.0.0.1.",
+    )
+    mcp.add_argument(
+        "--port",
+        type=int,
+        default=8000,
+        help="HTTP bind port (only with --http). Default: 8000.",
+    )
+    mcp.set_defaults(transport="stdio")
+    return parser.parse_args(argv)
 
 
 def main() -> None:
+    args = _parse_args(sys.argv[1:])
     try:
         cfg = load_config()
     except ConfigError as exc:
-        # Logging not configured yet; write to stderr so the operator sees it.
         sys.stderr.write(f"config error: {exc}\n")
         sys.exit(2)
-    configure_logging(level=cfg.log_level)
+
+    # MCP stdio owns stdout for JSON-RPC framing — logs must go to stderr or
+    # they will corrupt the protocol channel. Hub mode and MCP-over-HTTP keep
+    # the existing stdout default.
+    log_stream = (
+        sys.stderr
+        if args.command == "mcp" and args.transport == "stdio"
+        else sys.stdout
+    )
+    configure_logging(level=cfg.log_level, stream=log_stream)
+
     try:
-        asyncio.run(run(cfg))
+        if args.command == "mcp":
+            asyncio.run(
+                run_mcp(cfg, transport=args.transport, host=args.host, port=args.port)
+            )
+        else:
+            asyncio.run(run_hub(cfg))
     except KeyboardInterrupt:
         pass
 

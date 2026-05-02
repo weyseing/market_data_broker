@@ -3,9 +3,9 @@
 A real-time crypto market-data hub. Ingests from Coinbase, distributes to many
 downstream consumers via a single demand-driven pub/sub bus, exposes itself
 both over plain WebSocket (for general clients) and over MCP (for LLM agents,
-Step 8 — pending).
+both stdio and streamable-HTTP transports).
 
-Status: Steps 1–7 + Step 10 done. MCP server pending. See
+Status: all plan steps complete. See
 [progress/20260425_implementation_plan.txt](progress/20260425_implementation_plan.txt).
 
 ---
@@ -28,6 +28,9 @@ The hub now exposes:
 
 - **WebSocket** at `ws://localhost:8765` — for streaming consumers
 - **HTTP** at `http://localhost:8080/status` — for operators / health checks
+- **MCP** via `python -m market_data_broker mcp --stdio` (for Claude Desktop /
+  inspector) or `mcp --http` (for remote agents — listens on
+  `http://127.0.0.1:8000/mcp` by default; override with `--host`/`--port`)
 
 Nothing is upstream-subscribed yet — the hub is **demand-driven**. It only
 asks Coinbase for a topic once a consumer has actually subscribed.
@@ -94,9 +97,12 @@ and the upstream Coinbase connection state — all updated in real time.
 - **server.ws** = downstream WebSocket fan-out. Each connection is a registry
   consumer.
 - **server.status** = HTTP `/status` + `/healthz`.
-
-The MCP server (Step 8) will sit beside `ws.py` and `status.py` as a third
-sibling under `server/`, sharing the same registry and snapshot.
+- **server.mcp_server** = MCP server (FastMCP) exposing `list_topics`,
+  `describe_topic`, `get_snapshot`, `get_hub_status`, `stream_topic`. Same
+  bus / registry / snapshot as the WS server; `stream_topic` registers a
+  transient registry consumer so refcounts and upstream sub/unsub compose
+  identically. Run via the `mcp` subcommand (separate process from the
+  WS hub today; Step 8 ships them as alternative public surfaces).
 
 ---
 
@@ -234,9 +240,10 @@ src/market_data_broker/
 │   └── coinbase.py    — Coinbase WS client + reconnect + reconcile
 └── server/
     ├── ws.py          — downstream WebSocket server
-    └── status.py      — HTTP /status + /healthz
+    ├── status.py      — HTTP /status + /healthz
+    └── mcp_server.py  — MCP server (FastMCP, stdio + streamable-HTTP)
 
-tests/                 — pytest suite (215 tests, all green)
+tests/                 — pytest suite (239 tests, all green)
 scripts/
 ├── start.sh           — venv-aware launcher
 ├── smoke_ws_client.py — minimal WS client for manual verification
