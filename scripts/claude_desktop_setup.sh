@@ -55,6 +55,12 @@ ${H}# Demo prompts (paste into Claude Desktop)${R}
   ${K}Health${R}    → Is the hub healthy? Any reconnect loops or drops?
   ${K}E2E${R}       → Give me BTC-USD mid, last 3 trades, and feed health.
   ${K}Failure${R}   → Describe topic 'coinbase.ticker.NOPE-USD'.
+  ${K}Demand${R}    → Demonstrate the demand-driven property. Call get_hub_status
+              first (note ETH-USD is NOT in upstream topics), then
+              stream_topic 'coinbase.matches.ETH-USD' for 5 frames,
+              then get_hub_status again — explain what changed and why.
+
+${D}Multi-client demo (no Claude needed): ./scripts/demo_multi_client.sh${R}
 EOF
 }
 

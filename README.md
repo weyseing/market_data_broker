@@ -60,6 +60,15 @@ Three options, depending on what you want to exercise:
 ./scripts/claude_desktop_setup.sh               # prints config + demo prompts
 ```
 
+**Multi-client lifecycle** — visualise fan-out + the "no leaked upstream subs"
+guarantee. Spawns 3 WS clients across 2 topics, kills them in sequence, and
+queries `/status` between each transition.
+
+```bash
+./scripts/start.sh                              # terminal 1
+./scripts/demo_multi_client.sh                  # terminal 2
+```
+
 Operator-side observability:
 
 ```bash
