@@ -12,11 +12,12 @@ Manual smoke tests against real Coinbase::
     # Hub mode (default).
     python -m market_data_broker
 
-    # MCP over stdio (Claude Desktop / inspector).
-    python -m market_data_broker mcp --stdio
+    # MCP over streamable-HTTP on port 8000 (default transport).
+    python -m market_data_broker mcp
 
-    # MCP over streamable-HTTP on port 8000 by default.
-    python -m market_data_broker mcp --http
+    # MCP over stdio — for parents that spawn the server (inspector,
+    # Claude Desktop without the mcp-remote bridge).
+    python -m market_data_broker mcp --stdio
 
     # Hub mode + a debug consumer for ingest verification without a WS client.
     MDB_DEBUG_SUBSCRIBE=coinbase.ticker.BTC-USD python -m market_data_broker
@@ -215,18 +216,26 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     mcp = sub.add_parser("mcp", help="Run the MCP server.")
     transport = mcp.add_mutually_exclusive_group()
     transport.add_argument(
-        "--stdio",
-        dest="transport",
-        action="store_const",
-        const="stdio",
-        help="Speak MCP over stdin/stdout (default — for Claude Desktop / inspector).",
-    )
-    transport.add_argument(
         "--http",
         dest="transport",
         action="store_const",
         const="http",
-        help="Speak MCP over streamable-HTTP (for Docker / remote agents).",
+        help=(
+            "Speak MCP over streamable-HTTP (default — for Docker, remote "
+            "agents, the inspector with Streamable-HTTP, and Claude Desktop "
+            "via the mcp-remote bridge)."
+        ),
+    )
+    transport.add_argument(
+        "--stdio",
+        dest="transport",
+        action="store_const",
+        const="stdio",
+        help=(
+            "Speak MCP over stdin/stdout (for parents that spawn the server "
+            "directly — e.g. the inspector script, or Claude Desktop without "
+            "the mcp-remote bridge)."
+        ),
     )
     mcp.add_argument(
         "--host",
@@ -239,7 +248,7 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         default=8000,
         help="HTTP bind port (only with --http). Default: 8000.",
     )
-    mcp.set_defaults(transport="stdio")
+    mcp.set_defaults(transport="http")
     return parser.parse_args(argv)
 
 

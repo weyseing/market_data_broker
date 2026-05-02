@@ -5,7 +5,7 @@
 #
 # Quick reference:
 #   ./scripts/start.sh                                # python hub (default)
-#   ./scripts/start.sh --service mcp                  # python mcp (stdio)
+#   ./scripts/start.sh --service mcp                  # python mcp (stdio, default)
 #   ./scripts/start.sh --service mcp --http           # python mcp (http)
 #   ./scripts/start.sh --mode docker                  # docker hub
 #   ./scripts/start.sh --mode docker --service mcp    # docker mcp on :8000
@@ -23,13 +23,13 @@ Usage: ./scripts/start.sh [--mode python|docker] [--service hub|mcp|all] [args..
   --service   hub (default) | mcp | all      (all = docker only)
   --help      Show this help.
 
-Python+mcp defaults to --http (Inspector / curl). Pass --stdio for the
-Claude Desktop path. Docker+mcp is always --http.
+Python+mcp defaults to --stdio (Claude Desktop / inspector). Pass --http
+for HTTP transport (curl / remote agents). Docker+mcp is always --http.
 
 Examples:
   ./scripts/start.sh                              # python hub
-  ./scripts/start.sh --service mcp                # python mcp (http on :8000)
-  ./scripts/start.sh --service mcp --stdio        # python mcp (stdio, Claude Desktop)
+  ./scripts/start.sh --service mcp                # python mcp (stdio, Claude Desktop / inspector)
+  ./scripts/start.sh --service mcp --http         # python mcp (http on :8000)
   ./scripts/start.sh --mode docker                # docker hub
   ./scripts/start.sh --mode docker --service mcp  # docker mcp on :8000
   ./scripts/start.sh --mode docker --service all  # docker hub + mcp
@@ -90,18 +90,10 @@ case "$mode" in
         exec .venv/bin/python -m market_data_broker "$@"
         ;;
       mcp)
-        # Default to --http (Inspector / curl / docker symmetry). Pass --stdio
-        # explicitly for the Claude Desktop path. Other passthrough args
-        # (--host / --port) work alongside the chosen transport.
-        has_transport=false
-        for arg in "$@"; do
-          case "$arg" in --http|--stdio) has_transport=true; break ;; esac
-        done
-        if $has_transport; then
-          exec .venv/bin/python -m market_data_broker mcp "$@"
-        else
-          exec .venv/bin/python -m market_data_broker mcp --http "$@"
-        fi
+        # Transport default lives in argparse (mcp.set_defaults(transport="stdio")
+        # in __main__.py) — pass --http explicitly for HTTP. Extra args
+        # (--http / --host / --port) flow through unchanged.
+        exec .venv/bin/python -m market_data_broker mcp "$@"
         ;;
     esac
     ;;

@@ -2,176 +2,70 @@
 
 A real-time crypto market-data hub. Ingests from Coinbase, distributes to many
 downstream consumers via a single demand-driven pub/sub bus, exposes itself
-both over plain WebSocket (for general clients) and over MCP (for LLM agents,
-both stdio and streamable-HTTP transports).
+both over plain WebSocket (for general clients) and over MCP (for LLM agents).
 
-Status: all plan steps complete. See
-[progress/20260425_implementation_plan.txt](progress/20260425_implementation_plan.txt).
+The hub is **demand-driven** — nothing is upstream-subscribed until a consumer
+asks for a topic.
 
 ---
 
 ## Quickstart
 
-Requires Python 3.11+.
+Requires Python 3.11+ (Docker works without Python on host).
 
 ```bash
 python3 -m venv .venv
 .venv/bin/pip install -e ".[dev]"
-./scripts/start.sh
+./scripts/start.sh                              # python hub (default)
 ```
 
-You'll see JSON logs on stdout — `hub.starting`, `ws_server.started`,
-`status_server.started`, `ingest.connected`, `hub.ready`. Ctrl+C to stop;
-shutdown takes ~1–3s while ingest closes the upstream WS cleanly.
+`scripts/start.sh` is the unified launcher. Two axes — **mode** (python or
+docker) and **service** (hub or mcp):
 
-The hub now exposes:
+| Command | What it runs |
+|---|---|
+| `./scripts/start.sh` | python hub — WS `:8765` + `/status :8080` |
+| `./scripts/start.sh --service mcp` | python mcp — HTTP `:8000` |
+| `./scripts/start.sh --mode docker` | docker hub |
+| `./scripts/start.sh --mode docker --service mcp` | docker mcp |
+| `./scripts/start.sh --mode docker --service all` | docker hub + mcp |
+| `./scripts/start.sh --help` | full reference |
 
-- **WebSocket** at `ws://localhost:8765` — for streaming consumers
-- **HTTP** at `http://localhost:8080/status` — for operators / health checks
-- **MCP** via `python -m market_data_broker mcp --stdio` (for Claude Desktop /
-  inspector) or `mcp --http` (for remote agents — listens on
-  `http://127.0.0.1:8000/mcp` by default; override with `--host`/`--port`)
-
-Nothing is upstream-subscribed yet — the hub is **demand-driven**. It only
-asks Coinbase for a topic once a consumer has actually subscribed.
-
-### Smoke-test it
-
-In another terminal:
-
-```bash
-# Stream 5 BTC-USD ticker frames from real Coinbase
-.venv/bin/python scripts/smoke_ws_client.py coinbase.ticker.BTC-USD 5
-
-# Inspect hub state
-curl -s http://localhost:8080/status | python -m json.tool
-
-# Liveness ping (for container health checks)
-curl -s http://localhost:8080/healthz
-```
-
-The `/status` response after a subscribe shows the consumer, the active topic,
-and the upstream Coinbase connection state — all updated in real time.
+Ctrl+C stops; shutdown takes ~1–3s while ingest closes the upstream WS cleanly.
 
 ---
 
-## What runs
+## Testing the hub
 
-```
-                     Coinbase WSS
-                         │
-                         ▼
-                  ┌─────────────┐
-                  │   ingest    │  reconnect, watchdog, demand reconcile
-                  └──────┬──────┘
-                         │ Message
-                         ▼
-                  ┌─────────────┐
-                  │     bus     │  in-memory pub/sub, drop-oldest backpressure
-                  └──────┬──────┘
-                         │
-              ┌──────────┼──────────┐
-              ▼          ▼          ▼
-        ┌─────────┐ ┌────────┐ ┌──────────┐
-        │ snapshot│ │registry│ │ ws_server│  ← downstream WS clients
-        └─────────┘ └────────┘ └──────────┘
-                         │
-                         ▼
-                  ┌────────────────┐
-                  │ status_server  │  ← GET /status, GET /healthz
-                  └────────────────┘
-```
+Three options, depending on what you want to exercise:
 
-- **ingest** owns one WebSocket to Coinbase. Reconnects with exponential
-  backoff. Stale-feed watchdog forces a reconnect if no frame arrives within
-  `heartbeat_timeout_seconds`.
-- **registry** ref-counts subscriptions. When a topic transitions 0→1 holders
-  it tells ingest to send an upstream `subscribe`; on 1→0 it sends an
-  `unsubscribe`. **No leaked upstream subs** — verified by
-  `test_disconnect_releases_topics_no_leak`.
-- **bus** is a routing primitive: each subscriber owns a bounded queue,
-  drop-oldest on overflow, dropped-message counter per consumer.
-- **snapshot** is a passive bus observer — caches last ticker / trade /
-  best-bid-ask per symbol. *Not* a registry consumer (would create artificial
-  upstream demand).
-- **server.ws** = downstream WebSocket fan-out. Each connection is a registry
-  consumer.
-- **server.status** = HTTP `/status` + `/healthz`.
-- **server.mcp_server** = MCP server (FastMCP) exposing `list_topics`,
-  `describe_topic`, `get_snapshot`, `get_hub_status`, `stream_topic`. Same
-  bus / registry / snapshot as the WS server; `stream_topic` registers a
-  transient registry consumer so refcounts and upstream sub/unsub compose
-  identically. Run via the `mcp` subcommand (separate process from the
-  WS hub today; Step 8 ships them as alternative public surfaces).
-
----
-
-## Run modes
-
-### Plain (development)
+**Plain WebSocket client** — exercises the WS server end of the pipeline.
 
 ```bash
-./scripts/start.sh
+./scripts/start.sh                                                     # terminal 1
+.venv/bin/python scripts/smoke_ws_client.py coinbase.ticker.BTC-USD 5  # terminal 2
 ```
 
-### With env-var overrides
-
-Defaults come from [config/default.yaml](config/default.yaml). Any value can
-be overridden by an env var — see [.env.example](.env.example) for the full
-list.
+**MCP Inspector** — UI for poking individual MCP tools.
 
 ```bash
-# Bind to a different WS port
-MDB_WS_PORT=9000 ./scripts/start.sh
-
-# Verbose logs
-LOG_LEVEL=DEBUG ./scripts/start.sh
-
-# Pre-subscribe a debug consumer (useful for manual ingest verification)
-MDB_DEBUG_SUBSCRIBE=coinbase.ticker.BTC-USD ./scripts/start.sh
-
-# Source a .env file persistently
-set -a; source .env; set +a; ./scripts/start.sh
+./scripts/start.sh --service mcp     # terminal 1: HTTP MCP on :8000
+./scripts/mcp_inspector.sh           # terminal 2: opens inspector pre-wired
 ```
 
-### Docker
+**Claude Desktop** — full LLM-agent end-to-end.
 
 ```bash
-./scripts/start.sh --docker
+./scripts/start.sh --service mcp                # terminal 1
+./scripts/claude_desktop_setup.sh               # prints config + demo prompts
 ```
 
-Builds the image (multi-stage, ~80 MB) and runs the container in the
-foreground via `docker compose up --build`. Ports 8765 + 8080 are published
-to the host, so `curl http://localhost:8080/status` and
-`scripts/smoke_ws_client.py` work the same as in local mode.
-
-Ctrl+C tears the container down cleanly. Manual control:
+Operator-side observability:
 
 ```bash
-docker compose up -d        # detached
-docker compose logs -f      # tail logs
-docker compose ps           # health status
-docker compose down         # stop and remove
+curl -s http://localhost:8080/status  | python -m json.tool   # hub state
+curl -s http://localhost:8080/healthz                         # liveness ping
 ```
-
-The image healthcheck pings `/healthz` every 30s; `docker ps` shows the
-container as `healthy` once the hub is up.
-
----
-
-## Configuration
-
-Three layers, highest wins:
-
-1. **Environment variables** — see [.env.example](.env.example).
-2. **YAML** — [config/default.yaml](config/default.yaml).
-3. **Pydantic model defaults** in [config.py](src/market_data_broker/config.py).
-
-The config object is built once at startup
-([__main__.py](src/market_data_broker/__main__.py)) and flows into each
-component via constructor kwargs. **No module other than `__main__.py` reads
-env vars.** Tests construct components directly with kwargs and don't need to
-manipulate the environment.
 
 ---
 
@@ -181,113 +75,93 @@ manipulate the environment.
 {venue}.{channel}.{product_id}     e.g. coinbase.ticker.BTC-USD
 ```
 
-Channels in scope today:
-
 | Channel | What it carries | Cadence |
 |---|---|---|
-| `ticker` | One ticker tick (last trade + post-trade top-of-book) | One per trade (~5 Hz on BTC) |
-| `matches` | One executed trade | One per trade |
-| `level2_batch` | L2 book snapshot then incremental updates | Snapshot once + diffs continuously |
+| `ticker` | Last trade + post-trade top-of-book | One per trade (~5 Hz on BTC) |
+| `matches` | Executed trades | One per trade |
+| `level2_batch` | L2 book snapshot then incremental updates | Snapshot once + diffs |
 
-The `venue.` prefix leaves room for a future `binance.*` ingest without
-schema or wire changes.
+The `venue.` prefix leaves room for adding e.g. `binance.*` later without
+schema changes.
 
 ---
 
-## Backpressure
+## Architecture
 
-- Each consumer's bus subscription has a bounded queue
-  (`bus.consumer_queue_size`, default 1000).
-- On overflow, the bus **drops the oldest** message and increments
-  `dropped_messages` for that consumer.
-- Per-connection cumulative drop cap (`bus.sustained_overflow_drops`, default
-  100) — exceeding it gets the consumer disconnected with WS close code 1013.
+```
+                    Coinbase WSS (one connection)
+                              │
+                              ▼
+                     ┌─────────────────┐
+                     │     ingest      │  reconnect, watchdog,
+                     └────────┬────────┘  demand reconcile
+                              │ Message envelope
+                              ▼
+                     ┌─────────────────┐
+                     │       bus       │  in-memory pub/sub,
+                     └────────┬────────┘  drop-oldest backpressure
+                              │
+                ┌─────────────┴─────────────┐
+                ▼ (passive observer)        ▼ (registry-mediated)
+          ┌───────────┐                ┌───────────┐
+          │ snapshot  │                │ registry  │  ref-counts holders;
+          │   cache   │                └─────┬─────┘  drives ingest sub/unsub
+          └───────────┘                      │       on 0↔1 edges
+                          ┌──────────────────┼──────────────────┐
+                          ▼                  ▼                  ▼
+                    ┌───────────┐      ┌───────────┐      ┌───────────┐
+                    │ server.ws │      │ server.mcp│      │server.    │
+                    │  :8765    │      │  :8000    │      │status:8080│
+                    └───────────┘      └───────────┘      └───────────┘
+                    WS clients         LLM agents          ops / health
+```
 
-Drop-oldest is intentional: a slow client cannot stall publishers or peers,
-but its own backlog gets trimmed.
+- **ingest** — owns the Coinbase WS; reconnect with backoff; demand reconcile.
+- **bus** — in-memory pub/sub; drop-oldest backpressure with per-consumer counters.
+- **registry** — ref-counts subscriptions; drives ingest sub/unsub at 0↔1 transitions. **No leaked upstream subs.**
+- **snapshot** — passive cache of last ticker / trade / top-of-book per symbol. Bus-direct (not a registry consumer) so it doesn't create artificial demand.
+- **server.ws / server.mcp / server.status** — public surfaces. Each WS / MCP connection is a registry consumer; status is read-only.
+
+The four-layer split (ingest → bus → registry → server surfaces) is the hinge
+of the design: adding a venue or a protocol means writing one new module, the
+others don't change.
+
+Full design choices, trade-offs, and extension paths in
+[docs/architecture.md](docs/architecture.md). LLM-facing context docs in
+[docs/](docs/) (`context.md`, `topics.md`, `worked_examples.md`,
+`failure_modes.md`).
+
+---
+
+## Configuration
+
+Defaults in [config/default.yaml](config/default.yaml). Override via env vars
+— see [.env.example](.env.example). Only
+[__main__.py](src/market_data_broker/__main__.py) reads env vars; every other
+module takes constructor kwargs.
 
 ---
 
 ## Restart-state caveats
 
-The hub holds **all state in memory**. On restart you lose:
+The hub holds **all state in memory** — no database, no persistence. On restart
+the snapshot cache, consumer subscriptions, and msg-rate stats are lost; clients
+are responsible for retry/reconnect; upstream Coinbase subscriptions are
+reconciled from new downstream demand.
 
-| State | Recovery |
-|---|---|
-| Snapshot store cache (last ticker, trade, top-of-book) | Repopulated as soon as the first messages flow on each tracked topic |
-| Active consumer subscriptions | Each consumer must reconnect and re-subscribe — clients are responsible for retry/backoff |
-| Upstream subscriptions to Coinbase | Reconciled from new downstream demand on the next session |
-| Registry message counters / msg-rate stats | Reset to zero |
-
-There is **no database**, no persistence layer. This is by design — the hub
-is a streaming pipe, not a store of record.
-
----
-
-## Layout
-
-```
-src/market_data_broker/
-├── __main__.py        — wires everything; entry point for python -m
-├── config.py          — Pydantic Config model + YAML/env loader
-├── bus.py             — InMemoryBus + Subscription
-├── registry.py        — ref-counts consumers, drives demand callbacks
-├── snapshot.py        — last-known-state cache per symbol
-├── topics.py          — venue.channel.product_id parser
-├── models.py          — Pydantic envelopes (Ticker, Trade, L2Update, …)
-├── logging_config.py  — structlog JSON setup
-├── ingest/
-│   └── coinbase.py    — Coinbase WS client + reconnect + reconcile
-└── server/
-    ├── ws.py          — downstream WebSocket server
-    ├── status.py      — HTTP /status + /healthz
-    └── mcp_server.py  — MCP server (FastMCP, stdio + streamable-HTTP)
-
-tests/                 — pytest suite (239 tests, all green)
-scripts/
-├── start.sh           — venv-aware launcher
-├── smoke_ws_client.py — minimal WS client for manual verification
-└── spike_coinbase.py  — Step 1.5 throwaway (talks directly to Coinbase)
-
-config/
-└── default.yaml       — runtime defaults, override via env vars
-
-progress/              — implementation log
-docs/                  — (Step 9) context docs for LLM agents
-```
-
----
-
-## Logging
-
-JSON to stdout via [structlog](https://www.structlog.org/). Every event has a
-namespaced `event` key (e.g. `ingest.subscribe_sent`, `ws_server.client_connected`),
-plus consistent fields where applicable: `consumer_id`, `topic`, `peer`.
-
-```bash
-LOG_LEVEL=DEBUG ./scripts/start.sh           # verbose
-./scripts/start.sh 2>&1 | jq -c .             # pretty-pipe through jq
-./scripts/start.sh 2>&1 | jq -r 'select(.event|startswith("ingest"))'
-```
+By design — the hub is a streaming pipe, not a store of record.
 
 ---
 
 ## Development
 
 ```bash
-# Run tests
-.venv/bin/python -m pytest -q
-
-# Lint
-.venv/bin/python -m ruff check src tests
-
-# Live smoke (assumes hub already running)
-.venv/bin/python scripts/smoke_ws_client.py coinbase.ticker.BTC-USD 5
-curl -s http://localhost:8080/status | python -m json.tool
+.venv/bin/python -m pytest -q              # 239 tests
+.venv/bin/python -m ruff check src tests   # lint
+LOG_LEVEL=DEBUG ./scripts/start.sh         # verbose structlog JSON
 ```
 
-Architectural conventions are in [CLAUDE.md](CLAUDE.md). Implementation log
-with rationale per step in
+Conventions: [CLAUDE.md](CLAUDE.md). Implementation log with rationale per step:
 [progress/20260425_implementation_plan.txt](progress/20260425_implementation_plan.txt).
 
 ---
