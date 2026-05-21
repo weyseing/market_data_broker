@@ -9,7 +9,7 @@ asks for a topic.
 
 ---
 
-## Quickstart
+## Quickstart 
 
 Requires Python 3.11+ (Docker works without Python on host).
 
